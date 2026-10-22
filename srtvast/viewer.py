@@ -6,6 +6,11 @@
 * Collects the JSON log events every component sends over UDP (see
   ``srtvast.UdpEventHandler``) and pushes them to the page over Server-Sent
   Events (``/events``), with a backlog for late joiners.
+* Behind Cloudflare Access (``--access-team`` + ``--access-aud``), every
+  request must carry a valid Access JWT; streams end when the user's session
+  does, and ``/api/session`` tells the page who is signed in until when.
+* ``/api/status`` reports how many streams are open and for how long nobody
+  has watched; the host's idle watchdog stops the instance on it.
 
     python -m srtvast.viewer --srt srt://stitcher:9002 --port 8090
 """
@@ -16,6 +21,8 @@ import argparse
 import collections
 import json
 import logging
+import math
+import os
 import queue
 import subprocess
 import threading
@@ -24,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import setup_logging
+from .access import AccessError, AccessVerifier, Identity, token_from_headers
 from .transport import udp_receiver
 from .ts import PacketReader
 
@@ -126,16 +134,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = self.path.split("?", 1)[0]
+        if path == "/health":
+            self._send(200, b"ok", "text/plain")
+            return
+        if path == "/api/status":  # counts only; polled by the host's idle watchdog
+            self._json(self.server.status())
+            return
+        who = self._identity()
+        if who is None:
+            return
         if path in ("/", "/index.html"):
             self._file(WEB_DIR / "index.html", "text/html; charset=utf-8")
+        elif path == "/api/session":
+            self._json({"email": who.email, "expires": None if math.isinf(who.expires) else who.expires,
+                        "auth": self.server.verifier is not None})
         elif path == "/live.ts":
-            self._live()
+            self._live(who)
         elif path == "/events":
-            self._events()
-        elif path == "/health":
-            self._send(200, b"ok", "text/plain")
+            self._events(who)
         else:
             self._send(404, b"not found", "text/plain")
+
+    def _identity(self) -> Identity | None:
+        """The signed-in user, or None after answering 403. Open access without a verifier."""
+        verifier = self.server.verifier
+        if verifier is None:
+            return Identity("", math.inf)
+        token = token_from_headers(self.headers)
+        try:
+            if not token:
+                raise AccessError("no Cloudflare Access token")
+            return verifier.verify(token)
+        except AccessError as exc:
+            log.warning("rejected %s %s: %s", self.address_string(), self.path, exc)
+            self._send(403, b"Forbidden: sign in through Cloudflare Access\n", "text/plain")
+            return None
+
+    def _json(self, data) -> None:
+        self._send(200, json.dumps(data).encode(), "application/json")
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -155,25 +191,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-    def _live(self) -> None:
+    def _live(self, who: Identity) -> None:
         hub = self.server.video
         q, _ = hub.subscribe()
-        log.info("viewer %s watching (%d now)", self.address_string(), len(hub))
+        name = who.email or self.address_string()
+        log.info("viewer %s watching (%d now)", name, len(hub))
         self._stream_headers("video/mp2t")
         try:
-            while True:
+            while time.time() < who.expires:
                 try:
                     self.wfile.write(q.get(timeout=1.0))
                 except queue.Empty:
                     if not hub.subscribed(q):
                         break  # dropped for falling behind
+            else:
+                log.info("viewer %s: session ended, stream closed", name)
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
             hub.unsubscribe(q)
-            log.info("viewer %s left", self.address_string())
+            self.server.touch()
+            log.info("viewer %s left", name)
 
-    def _events(self) -> None:
+    def _events(self, who: Identity) -> None:
         hub = self.server.events
         q, backlog = hub.subscribe()
         self._stream_headers("text/event-stream")
@@ -181,6 +221,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(b"event: backlog\ndata: " + json.dumps(backlog).encode() + b"\n\n")
             last = time.monotonic()
             while True:
+                if time.time() >= who.expires:
+                    self.wfile.write(b"event: expired\ndata: {}\n\n")
+                    break
                 try:
                     event = q.get(timeout=1.0)
                     self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
@@ -195,15 +238,26 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             hub.unsubscribe(q)
+            self.server.touch()
 
 
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, video: Hub, events: Hub) -> None:
+    def __init__(self, addr, video: Hub, events: Hub, verifier: AccessVerifier | None = None) -> None:
         super().__init__(addr, Handler)
         self.video = video
         self.events = events
+        self.verifier = verifier
+        self.last_active = time.time()  # when the last stream closed (or the server started)
+
+    def touch(self) -> None:
+        self.last_active = time.time()
+
+    def status(self) -> dict:
+        open_streams = len(self.video) + len(self.events)
+        idle = 0.0 if open_streams else time.time() - self.last_active
+        return {"streams": open_streams, "watching": len(self.video), "idle_seconds": round(idle, 1)}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -214,17 +268,25 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--backlog", type=int, default=500, help="events replayed to a newly opened page")
+    p.add_argument("--access-team", default=os.environ.get("CF_ACCESS_TEAM_DOMAIN"),
+                   help="Cloudflare Access team domain (myteam.cloudflareaccess.com); enables JWT checks")
+    p.add_argument("--access-aud", default=os.environ.get("CF_ACCESS_AUD"),
+                   help="Cloudflare Access application audience (AUD) tag")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     setup_logging(args.log_level)
+    if bool(args.access_team) != bool(args.access_aud):
+        p.error("--access-team and --access-aud go together")
+    verifier = AccessVerifier(args.access_team, args.access_aud) if args.access_team else None
 
     video = Hub(maxsize=2000)            # ~20 s of 2.6 Mb/s in 1316-byte chunks
     events = Hub(maxsize=1000, backlog=args.backlog)
     logging.getLogger().addHandler(HubLogHandler(events))
     threading.Thread(target=pull_srt, args=(args.srt, video), daemon=True, name="srt").start()
     threading.Thread(target=receive_events, args=(args.events_udp, events), daemon=True, name="events").start()
-    server = ViewerServer((args.host, args.port), video, events)
-    log.info("viewer on http://%s:%d (feed %s, events udp %s)", args.host, args.port, args.srt, args.events_udp)
+    server = ViewerServer((args.host, args.port), video, events, verifier)
+    log.info("viewer on http://%s:%d (feed %s, events udp %s, %s)", args.host, args.port, args.srt, args.events_udp,
+             f"Cloudflare Access {verifier.issuer}" if verifier else "no authentication")
     server.serve_forever()
 
 

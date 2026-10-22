@@ -1,0 +1,10 @@
+[Unit]
+Description=Idle watchdog for the SRT VAST instance
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

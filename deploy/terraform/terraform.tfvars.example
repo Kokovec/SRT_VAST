@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+
+cloudflare_account_id = "0123456789abcdef0123456789abcdef"
+cloudflare_zone_id    = "fedcba9876543210fedcba9876543210"
+hostname              = "srt.example.com"
+access_team_domain    = "myteam.cloudflareaccess.com"
+
+allowed_emails = [
+  "you@example.com",
+  "colleague@example.com",
+]
+
+# From `terraform output` in deploy/bootstrap:
+permissions_boundary_arn = "arn:aws:iam::123456789012:policy/srt-vast-boundary"
+
+# Defaults, shown for reference:
+# aws_region       = "us-west-2"
+# instance_type    = "c7g.large"
+# session_duration = "30m"
+# idle_minutes     = 5
+# max_uptime_hours = 12
+# create_otp_login = true   # false if your Zero Trust team already has the one-time PIN login method

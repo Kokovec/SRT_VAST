@@ -39,6 +39,11 @@
   .conn { display: flex; gap: 14px; margin-left: auto; color: var(--muted); font-size: 12px; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--error); margin-right: 6px; }
   .dot.ok { background: var(--program); }
+  .session { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .session b { color: var(--text); font-weight: 600; }
+  .session a { color: var(--text); text-decoration: none; border: 1px solid var(--line); border-radius: 6px;
+               padding: 3px 10px; background: var(--panel-2); }
+  .session a:hover { border-color: var(--muted); }
 
   /* ---- log pane ---- */
   .log-pane { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: var(--panel); }
@@ -143,6 +148,11 @@
     <div class="conn">
       <span><span class="dot" id="dot-video"></span>video</span>
       <span><span class="dot" id="dot-events"></span>events</span>
+    </div>
+    <div class="session" id="session" hidden>
+      <span><b id="who"></b></span>
+      <span>session ends in <b id="session-left">–</b></span>
+      <a href="/cdn-cgi/access/logout">Log out</a>
     </div>
   </header>
 
@@ -353,8 +363,43 @@
     localStorageSet("delay", e.target.value);
   });
 
+  // ------------------------------------------------------------ session
+  // Behind Cloudflare Access the viewer reports who is signed in and when the
+  // session ends; at that point the server closes the streams and the page
+  // goes back through sign-in.
+  let sessionEnds = null;
+  let ended = false;
+
+  function endSession() {
+    if (ended) return;
+    ended = true;
+    if (player) { try { player.destroy(); } catch { /* gone */ } player = null; }
+    $("overlay").hidden = false;
+    $("overlay").textContent = "Your session has ended. Taking you back to sign-in…";
+    setTimeout(() => { location.href = "/"; }, 2500);
+  }
+
+  fetch("/api/session", { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((s) => {
+      if (!s || !s.auth) return;
+      $("session").hidden = false;
+      $("who").textContent = s.email || "signed in";
+      sessionEnds = s.expires;
+    })
+    .catch(() => {});
+
+  setInterval(() => {
+    if (sessionEnds == null) return;
+    const left = sessionEnds - Date.now() / 1000;
+    if (left <= 0) { $("session-left").textContent = "0:00"; endSession(); return; }
+    const m = Math.floor(left / 60), sec = Math.floor(left % 60);
+    $("session-left").textContent = `${m}:${String(sec).padStart(2, "0")}`;
+  }, 1000);
+
   function connectEvents() {
     const es = new EventSource("/events");
+    es.addEventListener("expired", () => { es.close(); endSession(); });
     es.addEventListener("backlog", (e) => {
       logEl.replaceChildren();
       for (const ev of JSON.parse(e.data)) deliver(ev, true);
@@ -610,6 +655,7 @@
   }
 
   function restartPlayer(why) {
+    if (ended) return;
     $("dot-video").classList.remove("ok");
     $("overlay").textContent = `Stream interrupted${why ? ` (${why})` : ""}, reconnecting…`;
     $("overlay").hidden = false;

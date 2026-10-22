@@ -53,10 +53,19 @@ A frame-accurate stitch shows no video PTS jumps, no CC errors, no PCR jumps,
 0 audio overlaps and 0 audio gaps, and for each break `out pts=… IDR, in pts=… IDR,
 900 frames inside` (for a 30 s break at 30 fps).
 
+## Deploying to AWS
+
+[deploy/README.md](deploy/README.md) explains how to run the stack on a single EC2 instance behind
+Cloudflare Access. Each person signs in with their own email, sessions last
+30 minutes, the instance starts when someone signs in and stops after 5 minutes
+with nobody watching, and no inbound ports are open. Terraform in
+[deploy/terraform/](deploy/terraform/) provisions all of it.
+
 ## Tests
 
 ```bash
 python3 -m unittest discover -s tests -t .
+node --test tests/js/waker.test.mjs   # the Cloudflare Worker
 ```
 
 `tests/tsgen.py` builds synthetic transport streams (ADTS audio muxed like ffmpeg,

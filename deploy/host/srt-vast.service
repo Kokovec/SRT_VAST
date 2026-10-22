@@ -1,0 +1,16 @@
+[Unit]
+Description=SRT VAST stack (fetch config + code bundle, docker compose up)
+Wants=network-online.target
+After=network-online.target docker.service snapd.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+ExecStart=/usr/local/bin/srt-vast-boot
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

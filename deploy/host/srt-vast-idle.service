@@ -1,0 +1,6 @@
+[Unit]
+Description=Stop the instance when nobody is watching
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/srt-vast-idle

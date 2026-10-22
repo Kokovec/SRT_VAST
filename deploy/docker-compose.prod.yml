@@ -1,0 +1,43 @@
+# Production override for the AWS deployment (see deploy/README.md):
+#
+#   docker compose -f docker-compose.yml -f deploy/docker-compose.prod.yml up -d
+#
+# * no service is reachable from outside the host: the only way in is the
+#   Cloudflare Tunnel (cloudflared dials out), and Cloudflare Access in front of
+#   it decides who gets through;
+# * the viewer verifies the Access JWT on every request and ends streams when
+#   the user's session ends;
+# * the viewer port is bound to the host's loopback only, for the idle watchdog;
+# * no recordings (they would fill the disk on a long-running host).
+#
+# Values come from /opt/srt-vast/.env, written at boot from SSM Parameter Store.
+
+services:
+  ads:
+    ports: !reset []
+    volumes: ["ads-media:/ads"]   # rendered creatives survive rebuilds
+
+  stitcher:
+    ports: !reset []
+    environment:
+      RECORD: ""
+
+  viewer:
+    ports: !override ["127.0.0.1:8090:8090"]
+    environment:
+      CF_ACCESS_TEAM_DOMAIN: ${CF_ACCESS_TEAM_DOMAIN:?set in .env}
+      CF_ACCESS_AUD: ${CF_ACCESS_AUD:?set in .env}
+
+  recorder:
+    profiles: ["debug"]   # not started in production
+
+  cloudflared:
+    image: cloudflare/cloudflared:2025.10.0
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set in .env}
+    restart: unless-stopped
+    depends_on: [viewer]
+
+volumes:
+  ads-media:

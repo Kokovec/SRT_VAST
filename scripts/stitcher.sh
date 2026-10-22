@@ -4,6 +4,7 @@ set -euo pipefail
 source /app/scripts/common.sh
 
 SRT_LATENCY=${SRT_LATENCY:-200}
+RECORD=${RECORD-/out/stitched.ts}   # set RECORD to empty to disable the recording
 mkdir -p /out
 
 forever srt-live-transmit -q "srt://:9000?mode=listener&latency=${SRT_LATENCY}" "udp://127.0.0.1:5001" &
@@ -21,4 +22,4 @@ ffmpeg -hide_banner -loglevel error -y \
 
 exec python -m srtvast.stitcher --slate "$SLATE" --conform /app/scripts/conform.sh \
   --input-udp 127.0.0.1:5001 --output-udp 127.0.0.1:5002,127.0.0.1:5003 \
-  --record /out/stitched.ts --ads-url "${ADS_URL}"
+  ${RECORD:+--record "$RECORD"} --ads-url "${ADS_URL}"
