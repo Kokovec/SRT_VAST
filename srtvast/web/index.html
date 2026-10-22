@@ -63,6 +63,17 @@
   .row .time { color: var(--muted); }
   .row .src { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; padding-top: 2px; }
   .row .msg { white-space: pre-wrap; word-break: break-word; }
+  .row .dbtn { font: 11px var(--sans); color: var(--muted); background: none; border: 1px solid var(--line);
+               border-radius: 4px; padding: 0 6px; margin-left: 6px; cursor: pointer; vertical-align: 1px; }
+  .row .dbtn:hover, .row .dbtn[aria-expanded="true"] { color: var(--text); border-color: var(--muted); }
+  .detail { grid-column: 1 / -1; margin: 4px 0 6px 72px; background: var(--bg); border: 1px solid var(--line);
+            border-radius: 6px; padding: 8px 10px; font: 11px/1.5 var(--mono); color: var(--text); font-weight: 400; }
+  .detail .dh { display: flex; gap: 8px; align-items: center; color: var(--muted); margin-bottom: 6px; flex-wrap: wrap; }
+  .detail .dh button { margin-left: auto; font: 11px var(--sans); color: var(--text); background: var(--panel-2);
+                       border: 1px solid var(--line); border-radius: 4px; padding: 1px 8px; cursor: pointer; }
+  .detail pre { margin: 0; white-space: pre; overflow: auto; max-height: 340px; }
+  .detail .k { color: var(--muted); }
+  .detail .raw { margin-top: 6px; word-break: break-all; white-space: pre-wrap; color: var(--muted); }
   .row.scte .msg { color: var(--scte); }
   .row.vast .msg { color: var(--vast); }
   .row.ad .msg { color: var(--ad); }
@@ -300,11 +311,109 @@
     const src = document.createElement("span"); src.className = "src"; src.textContent = ev.logger;
     const msg = document.createElement("span"); msg.className = "msg"; msg.textContent = ev.msg.trim();
     row.append(time, src, msg);
+    if (ev.detail) addDetail(row, msg, ev.detail);
     row.hidden = !visible(row);
     logEl.append(row);
     while (logEl.childElementCount > MAX_ROWS) logEl.firstElementChild.remove();
     if (follow) logEl.scrollTop = logEl.scrollHeight;
     else if (!row.hidden) $("jump").classList.add("show");
+  }
+
+  // ------------------------------------------------ SCTE-35 / VAST payloads
+  // Events may carry the decoded SCTE-35 section or the VAST request/XML;
+  // a toggle on the row expands them. Everything is inserted as text.
+  const DETAIL_LABEL = { scte35: "SCTE-35", "vast-request": "request", vast: "VAST XML" };
+
+  function addDetail(row, msg, detail) {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.className = "dbtn"; btn.setAttribute("aria-expanded", "false");
+    btn.textContent = `▸ ${DETAIL_LABEL[detail.kind] || "details"}`;
+    msg.append(btn);
+    let panel = null;
+    btn.addEventListener("click", () => {
+      const open = btn.getAttribute("aria-expanded") !== "true";
+      btn.setAttribute("aria-expanded", String(open));
+      btn.textContent = `${open ? "▾" : "▸"} ${DETAIL_LABEL[detail.kind] || "details"}`;
+      if (open && !panel) { panel = renderDetail(detail); row.append(panel); }
+      if (panel) panel.hidden = !open;
+    });
+  }
+
+  function el(tag, cls, text) {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  }
+
+  function header(parts, copyText) {
+    const h = el("div", "dh");
+    for (const p of parts) h.append(el("span", null, p));
+    if (copyText) {
+      const b = el("button", null, "Copy");
+      b.type = "button";
+      b.addEventListener("click", () => {
+        navigator.clipboard?.writeText(copyText).then(() => { b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1200); });
+      });
+      h.append(b);
+    }
+    return h;
+  }
+
+  // Indented "key: value" lines; {ticks, seconds} pairs print as "ticks (seconds s)".
+  function treeLines(value, indent, out) {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === "base64" || k === "hex" || k === "raw") continue;
+      const pad = "  ".repeat(indent);
+      if (v && typeof v === "object" && "ticks" in v && "seconds" in v) {
+        out.push([pad, k, `${v.ticks}  (${v.seconds} s)`]);
+      } else if (Array.isArray(v)) {
+        out.push([pad, k, v.length ? "" : "[]"]);
+        v.forEach((item, i) => {
+          if (item && typeof item === "object") {
+            out.push([pad + "  ", `[${i}]`, item.name || ""]);
+            treeLines(item, indent + 2, out);
+          } else out.push([pad + "  ", `[${i}]`, String(item)]);
+        });
+      } else if (v && typeof v === "object") {
+        out.push([pad, k, Object.keys(v).length ? "" : "{}"]);
+        treeLines(v, indent + 1, out);
+      } else {
+        out.push([pad, k, String(v)]);
+      }
+    }
+    return out;
+  }
+
+  function renderDetail(d) {
+    const box = el("div", "detail");
+    if (d.kind === "scte35") {
+      const sec = d.section || {};
+      box.append(header([`${d.direction === "sent" ? "Sent" : "Received"} on PID ${d.pid || "?"}`,
+                         sec.crc_ok === false ? "CRC FAILED" : "CRC ok"], JSON.stringify(sec, null, 2)));
+      const pre = el("pre");
+      for (const [pad, k, v] of treeLines(sec, 0, [])) {
+        pre.append(document.createTextNode(pad));
+        pre.append(el("span", "k", `${k}: `));
+        pre.append(document.createTextNode(`${v}\n`));
+      }
+      box.append(pre);
+      box.append(el("div", "raw", `base64  ${sec.base64 || ""}\nhex     ${sec.hex || ""}`));
+    } else if (d.kind === "vast-request") {
+      box.append(header([`GET for break ${d.break}`], d.url));
+      const pre = el("pre");
+      pre.append(el("span", "k", "url: "), document.createTextNode(`${d.url}\n`));
+      for (const [k, v] of Object.entries(d.query || {})) {
+        pre.append(el("span", "k", `  ${k}: `), document.createTextNode(`${v}\n`));
+      }
+      box.append(pre);
+    } else if (d.kind === "vast") {
+      box.append(header([d.error ? `failed: ${d.error}` : `${d.bytes} bytes · ${d.elapsed_ms} ms`, d.url], d.xml || d.url));
+      if (d.xml) box.append(el("pre", null, d.xml));
+    } else {
+      box.append(el("pre", null, JSON.stringify(d, null, 2)));
+    }
+    return box;
   }
 
   function refilter() {

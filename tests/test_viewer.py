@@ -122,3 +122,13 @@ class ForwarderTests(unittest.TestCase):
             fwd.send(b"\x47" * 188)
         self.assertLess(time.monotonic() - started, 0.1)
         fwd.sock.close()
+
+
+class EventDetailTests(unittest.TestCase):
+    def test_detail_travels_with_the_event(self):
+        from srtvast import event_dict
+        rec = logging.LogRecord("stitcher", logging.INFO, __file__, 1, "VAST response %s", ("ok",), None)
+        rec.detail = {"kind": "vast", "xml": "<VAST/>"}
+        self.assertEqual(event_dict(rec)["detail"], {"kind": "vast", "xml": "<VAST/>"})
+        plain = logging.LogRecord("stitcher", logging.INFO, __file__, 1, "x", (), None)
+        self.assertNotIn("detail", event_dict(plain))

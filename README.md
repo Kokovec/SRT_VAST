@@ -79,6 +79,12 @@ http://localhost:8090 (locally; on AWS, behind sign-in at the deployment's URL):
   `EVENTS_UDP` is set; the page shows cues, VAST, conforms, splices and
   beacons, with an on-air badge (PROGRAM / AD BREAK n, current ad, break
   progress) and a slider that delays events to match the player.
+- **SCTE-35 and VAST payloads:** rows with a ▸ toggle expand to the full message:
+  every SCTE-35 section the source sends and the stitcher receives, decoded field by
+  field (splice command, every descriptor including segmentation type/UPID/duration,
+  CRC) with the raw base64 and hex; every VAST request (URL and parameters, including
+  wrapper hops) and the raw VAST XML response with its size and response time. Each
+  panel has a Copy button. The decoder is `scte35.describe()`.
 - **Splice timing:** expected (cue) vs. actual break times, and per-break
   splice accuracy in milliseconds.
 

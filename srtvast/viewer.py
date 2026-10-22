@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
-from . import setup_logging
+from . import event_dict, setup_logging
 from .auth import SESSION_COOKIE, AuthError, Identity, JwtVerifier, cookie_value
 from .transport import udp_receiver
 from .ts import PTS_HZ, PacketReader, find_pmt, get_pid, get_pts_dts, is_pusi, pts_diff, video_stream
@@ -99,8 +99,7 @@ class HubLogHandler(logging.Handler):
         self.hub = hub
 
     def emit(self, record: logging.LogRecord) -> None:
-        self.hub.publish({"t": record.created, "level": record.levelname,
-                          "logger": record.name, "msg": record.getMessage()})
+        self.hub.publish(event_dict(record))
 
 
 class VideoClock:

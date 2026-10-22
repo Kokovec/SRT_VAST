@@ -146,7 +146,9 @@ class CueInjector:
             self.write(p)
         log.info("cue %s %-3s event=%d splice pts=%d (frame %d) in %.1fs duration=%.3fs (%d frames)",
                  self.mode, kind, eid, at, pts_diff(at, self.base_pts) // self.frame_ticks, lead,
-                 duration / PTS_HZ, duration // self.frame_ticks)
+                 duration / PTS_HZ, duration // self.frame_ticks,
+                 extra={"detail": {"kind": "scte35", "direction": "sent", "pid": f"0x{self.scte35_pid:X}",
+                                   "section": scte35.describe(section)}})
 
 
 def main(argv: list[str] | None = None) -> None:

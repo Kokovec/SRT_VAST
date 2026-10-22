@@ -6,6 +6,19 @@ import os
 import socket
 
 
+MAX_EVENT_BYTES = 60_000
+
+
+def event_dict(record: logging.LogRecord) -> dict:
+    """A log record as a web-monitor event. ``extra={"detail": {...}}`` adds structured data
+    (decoded SCTE-35 sections, VAST requests and XML) that the page can expand."""
+    event = {"t": record.created, "level": record.levelname, "logger": record.name, "msg": record.getMessage()}
+    detail = getattr(record, "detail", None)
+    if detail is not None:
+        event["detail"] = detail
+    return event
+
+
 class UdpEventHandler(logging.Handler):
     """Sends each log record as a JSON datagram (to the web viewer).
 
@@ -22,12 +35,11 @@ class UdpEventHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            payload = json.dumps({
-                "t": record.created,
-                "level": record.levelname,
-                "logger": record.name,
-                "msg": record.getMessage(),
-            }).encode()
+            payload = json.dumps(event_dict(record)).encode()
+            if len(payload) > MAX_EVENT_BYTES:  # stay inside one UDP datagram
+                event = event_dict(record)
+                event["detail"] = {"kind": event["detail"].get("kind"), "error": "detail too large to send"}
+                payload = json.dumps(event).encode()
         except Exception:  # noqa: BLE001 - never let logging break the stream
             return
         for target in self.targets:

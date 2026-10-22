@@ -203,8 +203,7 @@ class VastPodLoader:
         seconds = (brk.duration or 30 * PTS_HZ) / PTS_HZ
         url = self.url_template.format(duration=f"{seconds:g}", event_id=brk.event_id,
                                        cachebuster=random.randint(0, 99_999_999))
-        log.info("VAST request %s", url)
-        ads = vast.fetch_ads(url, timeout=self.timeout)
+        ads = vast.fetch_ads(url, timeout=self.timeout, fetch=lambda u: self._fetch_vast(u, brk.event_id))
         if not ads:
             raise LookupError("VAST response had no ads")
         jobs = []
@@ -225,6 +224,31 @@ class VastPodLoader:
         if not media:
             raise LookupError("no playable ads in VAST response")
         return build_pod(media, content_streams)
+
+    def _fetch_vast(self, url: str, event_id: int) -> bytes:
+        """One VAST HTTP exchange (the tag or a wrapper hop), logged with the raw XML."""
+        query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+        log.info("VAST request %s", url,
+                 extra={"detail": {"kind": "vast-request", "break": event_id, "url": url, "query": query}})
+        started = time.monotonic()
+        try:
+            data = vast.http_get(url, self.timeout)
+        except Exception as exc:
+            log.warning("VAST request failed %s: %s", url, exc,
+                        extra={"detail": {"kind": "vast", "break": event_id, "url": url, "error": str(exc)}})
+            raise
+        elapsed = (time.monotonic() - started) * 1000
+        text = data.decode("utf-8", errors="replace")
+        try:
+            items = vast.parse_vast(data)
+            summary = ", ".join(f"{'wrapper' if isinstance(i, vast.Wrapper) else 'ad'} "
+                                f"{getattr(i, 'ad_id', '') or getattr(i, 'ad_tag_uri', '')}" for i in items) or "no ads"
+        except Exception as exc:  # noqa: BLE001 - shown, then fetch_ads raises properly
+            summary = f"unparseable: {exc}"
+        log.info("VAST response for break %d: %s (%d bytes, %.0f ms)", event_id, summary, len(data), elapsed,
+                 extra={"detail": {"kind": "vast", "break": event_id, "url": url, "bytes": len(data),
+                                   "elapsed_ms": round(elapsed), "xml": text}})
+        return data
 
     def _job(self, ad: vast.Ad, event_id: int) -> Future | None:
         if ad.mezzanine and self.conform_cmd:
@@ -599,6 +623,7 @@ class Stitcher:
         self.frame_ticks = 3000             # content video frame duration, measured
         self.pending: dict[int, Break] = {}
         self.active: ActiveBreak | None = None
+        self._seen_sections: deque = deque(maxlen=256)  # cues already shown in the event log
         self.finished: set[int] = set()
 
     # -- input -------------------------------------------------------------
@@ -630,8 +655,11 @@ class Stitcher:
             try:
                 info = scte35.parse(sec)
             except ValueError as exc:
-                log.warning("bad SCTE-35 section on PID 0x%X: %s", pid, exc)
+                log.warning("bad SCTE-35 section on PID 0x%X: %s", pid, exc,
+                            extra={"detail": {"kind": "scte35", "direction": "received", "pid": f"0x{pid:X}",
+                                              "section": scte35.describe(sec)}})
                 return
+            self._log_section(pid, sec, info)
             self._on_splice_info(info)
             return
         if not section_crc_ok(sec):
@@ -658,6 +686,19 @@ class Stitcher:
                          ", ".join(f"0x{p:X}" for p in scte) or "none")
 
     # -- cues --------------------------------------------------------------
+
+    def _log_section(self, pid: int, sec: bytes, info: scte35.SpliceInfo) -> None:
+        """Put a received SCTE-35 section, fully decoded, in the event log (once per cue)."""
+        cue = info.cue()
+        key = (cue.kind, cue.event_id) if cue else (info.command_type, bytes(sec))
+        if key in self._seen_sections:
+            return  # the source repeats each cue ahead of the splice
+        self._seen_sections.append(key)
+        name = scte35.COMMAND_NAMES.get(info.command_type, f"0x{info.command_type:02X}")
+        what = f" {cue.kind} event={cue.event_id}" if cue else ""
+        log.info("SCTE-35 received on PID 0x%X: %s%s", pid, name, what,
+                 extra={"detail": {"kind": "scte35", "direction": "received", "pid": f"0x{pid:X}",
+                                   "section": scte35.describe(sec)}})
 
     def _on_splice_info(self, info: scte35.SpliceInfo) -> None:
         cue = info.cue()

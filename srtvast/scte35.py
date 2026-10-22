@@ -6,6 +6,7 @@ segmentation_descriptor, which covers the cues ad insertion cares about.
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 
 from .ts import PTS_MOD, crc32_mpeg2, section_length
@@ -313,3 +314,194 @@ def build_time_signal(pts: int | None, segmentation: list[SegmentationDescriptor
     _write_splice_time(w, pts)
     descriptors = b"".join(build_segmentation_descriptor(s) for s in segmentation)
     return _build_section(CMD_TIME_SIGNAL, w.to_bytes(), descriptors, pts_adjustment)
+
+
+# --------------------------------------------------------------------------
+# Describing (every field, for display; never raises)
+# --------------------------------------------------------------------------
+
+COMMAND_NAMES = {0x00: "splice_null", 0x04: "splice_schedule", 0x05: "splice_insert", 0x06: "time_signal",
+                 0x07: "bandwidth_reservation", 0xFF: "private_command"}
+DESCRIPTOR_NAMES = {0x00: "avail_descriptor", 0x01: "DTMF_descriptor", 0x02: "segmentation_descriptor",
+                    0x03: "time_descriptor", 0x04: "audio_descriptor"}
+SEGMENTATION_TYPE_NAMES = {
+    0x00: "Not Indicated", 0x01: "Content Identification", 0x10: "Program Start", 0x11: "Program End",
+    0x12: "Program Early Termination", 0x13: "Program Breakaway", 0x14: "Program Resumption",
+    0x15: "Program Runover Planned", 0x16: "Program Runover Unplanned", 0x17: "Program Overlap Start",
+    0x18: "Program Blackout Override", 0x19: "Program Join", 0x20: "Chapter Start", 0x21: "Chapter End",
+    0x22: "Break Start", 0x23: "Break End", 0x24: "Opening Credit Start", 0x25: "Opening Credit End",
+    0x26: "Closing Credit Start", 0x27: "Closing Credit End", 0x30: "Provider Advertisement Start",
+    0x31: "Provider Advertisement End", 0x32: "Distributor Advertisement Start",
+    0x33: "Distributor Advertisement End", 0x34: "Provider Placement Opportunity Start",
+    0x35: "Provider Placement Opportunity End", 0x36: "Distributor Placement Opportunity Start",
+    0x37: "Distributor Placement Opportunity End", 0x38: "Provider Overlay Placement Opportunity Start",
+    0x39: "Provider Overlay Placement Opportunity End", 0x3A: "Distributor Overlay Placement Opportunity Start",
+    0x3B: "Distributor Overlay Placement Opportunity End", 0x40: "Unscheduled Event Start",
+    0x41: "Unscheduled Event End", 0x50: "Network Start", 0x51: "Network End",
+}
+UPID_TYPE_NAMES = {0x00: "Not Used", 0x01: "User Defined (deprecated)", 0x02: "ISCI (deprecated)", 0x03: "Ad-ID",
+                   0x04: "UMID", 0x05: "ISAN (deprecated)", 0x06: "ISAN", 0x07: "TID", 0x08: "TI", 0x09: "ADI",
+                   0x0A: "EIDR", 0x0B: "ATSC Content Identifier", 0x0C: "MPU", 0x0D: "MID", 0x0E: "ADS Information",
+                   0x0F: "URI", 0x10: "UUID", 0x11: "SCR"}
+
+
+def _ticks(value: int) -> dict:
+    return {"ticks": value, "seconds": round(value / 90000, 6)}
+
+
+def _describe_splice_time(r: BitReader) -> dict:
+    if r.read(1):
+        r.read(6)
+        return {"time_specified_flag": 1, "pts_time": _ticks(r.read(33))}
+    r.read(7)
+    return {"time_specified_flag": 0}
+
+
+def _describe_splice_insert(r: BitReader) -> dict:
+    d = {"splice_event_id": r.read(32)}
+    d["splice_event_cancel_indicator"] = r.read(1)
+    r.read(7)
+    if d["splice_event_cancel_indicator"]:
+        return d
+    d["out_of_network_indicator"] = r.read(1)
+    d["program_splice_flag"] = r.read(1)
+    d["duration_flag"] = r.read(1)
+    d["splice_immediate_flag"] = r.read(1)
+    d["event_id_compliance_flag"] = r.read(1)
+    r.read(3)
+    if d["program_splice_flag"] and not d["splice_immediate_flag"]:
+        d["splice_time"] = _describe_splice_time(r)
+    if not d["program_splice_flag"]:
+        comps = []
+        for _ in range(r.read(8)):
+            c = {"component_tag": r.read(8)}
+            if not d["splice_immediate_flag"]:
+                c["splice_time"] = _describe_splice_time(r)
+            comps.append(c)
+        d["components"] = comps
+    if d["duration_flag"]:
+        auto_return = r.read(1)
+        r.read(6)
+        d["break_duration"] = {"auto_return": auto_return, "duration": _ticks(r.read(33))}
+    d["unique_program_id"] = r.read(16)
+    d["avail_num"] = r.read(8)
+    d["avails_expected"] = r.read(8)
+    return d
+
+
+def _upid_text(upid: bytes) -> str:
+    if upid and all(32 <= b < 127 for b in upid):
+        return upid.decode("ascii")
+    return upid.hex()
+
+
+def _describe_descriptor(tag: int, body: bytes) -> dict:
+    d = {"splice_descriptor_tag": f"0x{tag:02X}", "name": DESCRIPTOR_NAMES.get(tag, "unknown"),
+         "descriptor_length": len(body)}
+    r = BitReader(body)
+    try:
+        identifier = r.read(32)
+        d["identifier"] = identifier.to_bytes(4, "big").decode("ascii", errors="replace")
+        if tag == 0x00:
+            d["provider_avail_id"] = r.read(32)
+        elif tag == 0x01:
+            d["preroll"] = r.read(8)
+            count = r.read(3)
+            r.read(5)
+            d["dtmf_chars"] = r.read_bytes(count).decode("ascii", errors="replace")
+        elif tag == 0x02:
+            d["segmentation_event_id"] = r.read(32)
+            d["segmentation_event_cancel_indicator"] = r.read(1)
+            r.read(7)
+            if not d["segmentation_event_cancel_indicator"]:
+                d["program_segmentation_flag"] = r.read(1)
+                d["segmentation_duration_flag"] = r.read(1)
+                d["delivery_not_restricted_flag"] = r.read(1)
+                if not d["delivery_not_restricted_flag"]:
+                    d["web_delivery_allowed_flag"] = r.read(1)
+                    d["no_regional_blackout_flag"] = r.read(1)
+                    d["archive_allowed_flag"] = r.read(1)
+                    d["device_restrictions"] = r.read(2)
+                else:
+                    r.read(5)
+                if not d["program_segmentation_flag"]:
+                    comps = []
+                    for _ in range(r.read(8)):
+                        tag_ = r.read(8)
+                        r.read(7)
+                        comps.append({"component_tag": tag_, "pts_offset": _ticks(r.read(33))})
+                    d["components"] = comps
+                if d["segmentation_duration_flag"]:
+                    d["segmentation_duration"] = _ticks(r.read(40))
+                upid_type = r.read(8)
+                upid = r.read_bytes(r.read(8))
+                d["segmentation_upid_type"] = f"0x{upid_type:02X} {UPID_TYPE_NAMES.get(upid_type, 'unknown')}"
+                d["segmentation_upid"] = _upid_text(upid)
+                type_id = r.read(8)
+                d["segmentation_type_id"] = f"0x{type_id:02X} {SEGMENTATION_TYPE_NAMES.get(type_id, 'unknown')}"
+                d["segment_num"] = r.read(8)
+                d["segments_expected"] = r.read(8)
+                if type_id in _SEG_SUB_SEGMENT_TYPES and r.bytes_left >= 2:
+                    d["sub_segment_num"] = r.read(8)
+                    d["sub_segments_expected"] = r.read(8)
+        elif tag == 0x03:
+            d["TAI_seconds"] = r.read(48)
+            d["TAI_ns"] = r.read(32)
+            d["UTC_offset"] = r.read(16)
+        else:
+            d["data"] = body[4:].hex()
+    except IndexError:
+        d["error"] = "descriptor truncated"
+    d["raw"] = body.hex()
+    return d
+
+
+def describe(section: bytes) -> dict:
+    """Every field of a splice_info_section, for display. Never raises."""
+    section = bytes(section)
+    out: dict = {"base64": base64.b64encode(section).decode(), "hex": section.hex()}
+    try:
+        total = 3 + section_length(section)
+        r = BitReader(section[:total])
+        out["table_id"] = f"0x{r.read(8):02X}"
+        out["section_syntax_indicator"] = r.read(1)
+        out["private_indicator"] = r.read(1)
+        out["sap_type"] = r.read(2)
+        out["section_length"] = r.read(12)
+        out["protocol_version"] = r.read(8)
+        out["encrypted_packet"] = r.read(1)
+        out["encryption_algorithm"] = r.read(6)
+        out["pts_adjustment"] = _ticks(r.read(33))
+        out["cw_index"] = r.read(8)
+        out["tier"] = f"0x{r.read(12):03X}"
+        command_length = r.read(12)
+        command_type = r.read(8)
+        out["splice_command_length"] = command_length
+        out["splice_command_type"] = f"0x{command_type:02X} {COMMAND_NAMES.get(command_type, 'unknown')}"
+        start = r.pos
+        if out["encrypted_packet"]:
+            out["splice_command"] = {"note": "encrypted"}
+        elif command_type == CMD_SPLICE_INSERT:
+            out["splice_command"] = _describe_splice_insert(r)
+        elif command_type == CMD_TIME_SIGNAL:
+            out["splice_command"] = _describe_splice_time(r)
+        elif command_type == CMD_SPLICE_NULL:
+            out["splice_command"] = {}
+        else:
+            out["splice_command"] = {"raw": section[start // 8:start // 8 + command_length].hex()}
+        if command_length != 0xFFF:
+            r.pos = start + command_length * 8
+        loop_length = r.read(16)
+        out["descriptor_loop_length"] = loop_length
+        i, end = r.pos // 8, r.pos // 8 + loop_length
+        descriptors = []
+        while i + 2 <= end and i + 2 <= total - 4:
+            tag, length = section[i], section[i + 1]
+            descriptors.append(_describe_descriptor(tag, section[i + 2:i + 2 + length]))
+            i += 2 + length
+        out["descriptors"] = descriptors
+        out["CRC_32"] = f"0x{int.from_bytes(section[total - 4:total], 'big'):08X}"
+        out["crc_ok"] = crc32_mpeg2(section[:total]) == 0
+    except (IndexError, ValueError) as exc:
+        out["error"] = f"could not decode: {exc}"
+    return out

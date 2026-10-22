@@ -53,3 +53,33 @@ class Scte35Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DescribeTests(unittest.TestCase):
+    def test_reference_sample_every_field(self):
+        d = scte35.describe(base64.b64decode("/DAvAAAAAAAA///wFAVIAACPf+/+c2nALv4AUsz1AAAAAAAKAAhDVUVJAAABNWLbowo="))
+        self.assertEqual(d["splice_command_type"], "0x05 splice_insert")
+        cmd = d["splice_command"]
+        self.assertEqual((cmd["splice_event_id"], cmd["out_of_network_indicator"]), (0x4800008F, 1))
+        self.assertEqual(cmd["break_duration"]["duration"]["ticks"], 5426421)
+        self.assertEqual(d["descriptors"][0]["name"], "avail_descriptor")
+        self.assertEqual(d["descriptors"][0]["provider_avail_id"], 309)
+        self.assertTrue(d["crc_ok"])
+
+    def test_time_signal_segmentation_fields(self):
+        seg = scte35.SegmentationDescriptor(event_id=77, type_id=0x34, duration=15 * 90000, upid_type=0x09,
+                                            upid=b"SRTVAST-77", segment_num=1, segments_expected=1)
+        d = scte35.describe(scte35.build_time_signal(123_456, [seg]))
+        self.assertEqual(d["splice_command_type"], "0x06 time_signal")
+        self.assertEqual(d["splice_command"]["pts_time"]["ticks"], 123_456)
+        sd = d["descriptors"][0]
+        self.assertEqual(sd["identifier"], "CUEI")
+        self.assertEqual(sd["segmentation_type_id"], "0x34 Provider Placement Opportunity Start")
+        self.assertEqual(sd["segmentation_upid_type"], "0x09 ADI")
+        self.assertEqual(sd["segmentation_upid"], "SRTVAST-77")
+        self.assertEqual(sd["segmentation_duration"]["seconds"], 15.0)
+
+    def test_garbage_never_raises(self):
+        for data in (b"", b"\xfc", b"\xfc\x30\x40" + b"\x00" * 5, bytes(range(40))):
+            d = scte35.describe(data)
+            self.assertIn("hex", d)
