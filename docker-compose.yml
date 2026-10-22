@@ -1,0 +1,45 @@
+# One image for every service; only `ads` builds it, the rest reuse it.
+x-app: &app
+  image: srt-vast:dev
+  pull_policy: never
+  restart: unless-stopped
+  init: true
+
+services:
+  ads:
+    <<: *app
+    build: .
+    command: /app/scripts/ads.sh
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 3s
+      retries: 60
+
+  stitcher:
+    <<: *app
+    command: /app/scripts/stitcher.sh
+    environment:
+      # Use /wrapper instead of /vast to exercise VAST wrapper resolution.
+      ADS_URL: "http://ads:8080/vast?dur={duration}&event={event_id}&cb={cachebuster}"
+    ports: ["9001:9001/udp"]
+    volumes: ["./out:/out"]
+    depends_on:
+      ads: { condition: service_healthy }
+
+  source:
+    <<: *app
+    command: /app/scripts/source.sh
+    environment:
+      BREAK_FIRST: 21.5     # seconds into the stream (off the 2 s GOP grid on purpose)
+      BREAK_INTERVAL: 60
+      BREAK_DURATION: 30
+      CUE_MODE: splice_insert   # or time_signal
+    depends_on: [stitcher]
+
+  # Pulls the stitched SRT output, proving the SRT egress leg works.
+  recorder:
+    <<: *app
+    command: ["bash", "-c", "source /app/scripts/common.sh; forever srt-live-transmit -q 'srt://stitcher:9001?mode=caller&latency=200' file://con >> /out/received.ts"]
+    volumes: ["./out:/out"]
+    depends_on: [stitcher]
