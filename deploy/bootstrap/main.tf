@@ -610,7 +610,16 @@ resource "aws_cognito_user_pool" "users" {
 
     invite_message_template {
       email_subject = "Your SRT VAST viewer sign-in"
-      email_message = "You have access to the SRT VAST stream viewer at https://${var.hostname}/ . Sign in with {username} and this temporary password: {####} (you will choose your own on first sign-in)."
+      # The password stands alone (no adjacent punctuation) so mail apps that
+      # extract "codes" pick it up correctly.
+      email_message = join("", [
+        "<p>You have access to the SRT VAST stream viewer.</p>",
+        "<p>Sign in at <a href=\"https://${var.hostname}/\">https://${var.hostname}/</a></p>",
+        "<p>Username: {username}</p>",
+        "<p>Temporary password:</p>",
+        "<p><b>{####}</b></p>",
+        "<p>You will choose your own password at your first sign-in. Forgot password only works after that first sign-in.</p>",
+      ])
       sms_message   = "SRT VAST sign-in: {username} / {####}"
     }
   }
