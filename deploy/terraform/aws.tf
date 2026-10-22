@@ -168,7 +168,8 @@ resource "aws_instance" "host" {
   subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.host.id]
   iam_instance_profile        = aws_iam_instance_profile.host.name
-  associate_public_ip_address = true # changes per start; the boot script updates origin.<hostname>
+  # Public IP comes from the subnet (map_public_ip_on_launch) and changes per start;
+  # the boot script updates origin.<hostname>.
 
   # The idle watchdog powers the OS off; that must STOP the instance, not terminate it.
   instance_initiated_shutdown_behavior = "stop"
@@ -207,7 +208,8 @@ resource "aws_instance" "host" {
   lifecycle {
     # New Ubuntu AMIs / script edits must not replace a running host; code
     # updates arrive through the S3 bundle at the next boot instead.
-    ignore_changes = [ami, user_data]
+    # associate_public_ip_address reads false whenever the instance is stopped.
+    ignore_changes = [ami, user_data, associate_public_ip_address]
   }
 
   depends_on = [aws_s3_object.bundle, aws_ssm_parameter.settings]

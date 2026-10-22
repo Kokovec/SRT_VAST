@@ -502,12 +502,21 @@ data "aws_iam_policy_document" "deploy" {
   statement {
     sid         = "OnlyThisRegion"
     effect      = "Deny"
-    not_actions = ["iam:*", "sts:*", "s3:*", "cloudfront:*", "route53:*", "acm:*"]
+    # kms: CloudFront attaching the ACM certificate makes a KMS call on the
+    # caller's behalf in us-east-1. The role has no KMS permissions of its own.
+    not_actions = ["iam:*", "sts:*", "s3:*", "cloudfront:*", "route53:*", "acm:*", "kms:*"]
     resources   = ["*"]
     condition {
       test     = "StringNotEquals"
       variable = "aws:RequestedRegion"
       values   = [local.region]
+    }
+    condition {
+      # Negated operators are true when the key is absent; internal service
+      # checks (e.g. CloudFront verifying the ACM certificate) carry no region.
+      test     = "Null"
+      variable = "aws:RequestedRegion"
+      values   = ["false"]
     }
   }
   statement {
@@ -519,6 +528,11 @@ data "aws_iam_policy_document" "deploy" {
       test     = "StringNotEquals"
       variable = "aws:RequestedRegion"
       values   = ["us-east-1"]
+    }
+    condition {
+      test     = "Null" # see OnlyThisRegion
+      variable = "aws:RequestedRegion"
+      values   = ["false"]
     }
   }
   statement {
