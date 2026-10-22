@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from . import hls, scte35, setup_logging, vast
-from .transport import UdpPacketWriter, udp_receiver
+from .transport import UdpForwarder, UdpPacketWriter, udp_receiver
 from .ts import (
     PID_PAT, PTS_HZ, PTS_MOD, STREAM_TYPE_AAC_ADTS, STREAM_TYPE_SCTE35, VIDEO_STREAM_TYPES,
     PacketReader, SectionAssembler, adts_frames, build_pes, find_pmt, get_cc, get_pcr,
@@ -65,6 +65,7 @@ log = logging.getLogger("stitcher")
 
 PCR_HZ = PTS_HZ * 300
 TOLERANCE = PTS_HZ // 60     # video timestamps this close are the same frame (half a frame at 30 fps)
+STALL_WARN = 0.3             # seconds: warn when input stops arriving, or one chunk takes this long
 MAX_LATE_CUE = PTS_HZ        # ignore cues whose splice time is >1 s in the past
 HOLD_SPAN = PTS_HZ           # audio PES starting this close to a splice point are held until complete
 SLATE_LEAD = 2 * PCR_HZ      # with no known break end, keep this much slate queued ahead
@@ -940,6 +941,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--slate", help="MPEG-TS slate (encoded like the content) used to fill short pods")
     p.add_argument("--conform", help="command that transcodes a mezzanine file to the stream profile "
                                      "(MPEG-TS on stdout); enables VAST <Mezzanine> handling")
+    p.add_argument("--tap-udp", default="",
+                   help="also forward the incoming (pre-stitch) stream here, e.g. viewer:5200 (comma-separated)")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     setup_logging(args.log_level)
@@ -951,6 +954,7 @@ def main(argv: list[str] | None = None) -> None:
         log.info("slate %s (%d bytes)", args.slate, len(slate))
     sock = udp_receiver(args.input_udp)
     outs = [UdpPacketWriter(addr) for addr in args.output_udp.split(",") if addr]
+    taps = [UdpForwarder(addr) for addr in args.tap_udp.split(",") if addr]
     record = open(args.record, "wb") if args.record else None
 
     def write(pkt: bytearray) -> None:
@@ -962,11 +966,23 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     stitcher = Stitcher(write, VastPodLoader(args.ads_url, conform_cmd=args.conform), slate=slate)
     reader = PacketReader()
-    log.info("listening on udp %s, output udp %s, record %s", args.input_udp, args.output_udp, args.record)
+    log.info("listening on udp %s, output udp %s, record %s, tap %s", args.input_udp, args.output_udp, args.record,
+             args.tap_udp or "off")
     try:
+        last_input = time.monotonic()
         while True:
-            for pkt in reader.feed(sock.recv(65536)):
+            data = sock.recv(65536)
+            received = time.monotonic()
+            if received - last_input > STALL_WARN:
+                log.warning("input stalled: nothing received for %.0f ms (upstream: source or SRT)",
+                            (received - last_input) * 1000)
+            for tap in taps:
+                tap.send(data)
+            for pkt in reader.feed(data):
                 stitcher.feed(pkt)
+            last_input = time.monotonic()
+            if last_input - received > STALL_WARN:
+                log.warning("slow processing: one input chunk took %.0f ms", (last_input - received) * 1000)
             for out in outs:
                 out.flush()
     except KeyboardInterrupt:

@@ -123,7 +123,7 @@ class ViewerAuthTests(unittest.TestCase):
         exp = int(time.time()) + 1800
         code, body, _ = self.get("/api/session", make_token(exp=exp))
         self.assertEqual(code, 200)
-        self.assertEqual(json.loads(body), {"email": "ana@example.com", "expires": exp, "auth": True})
+        self.assertEqual(json.loads(body), {"email": "ana@example.com", "expires": exp, "auth": True, "preview": False})
         code, body, _ = self.get("/api/status")  # watchdog endpoint: no session needed, counts only
         status = json.loads(body)
         self.assertEqual((code, status["streams"]), (200, 0))

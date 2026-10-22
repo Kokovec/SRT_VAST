@@ -25,6 +25,7 @@ services:
       EVENTS_UDP: viewer:5100
       # Use /wrapper instead of /vast to exercise VAST wrapper resolution.
       ADS_URL: "http://ads:8080/vast?dur={duration}&event={event_id}&cb={cachebuster}"
+      TAP_UDP: viewer:5200     # copy of the incoming stream for the viewer's pre-stitch preview
     ports: ["9001:9001/udp"]
     volumes: ["./out:/out"]
     depends_on:
@@ -46,7 +47,8 @@ services:
   # Open http://localhost:8090
   viewer:
     <<: *app
-    command: ["python", "-m", "srtvast.viewer", "--srt", "srt://stitcher:9002?mode=caller&latency=200", "--port", "8090"]
+    command: ["python", "-m", "srtvast.viewer", "--srt", "srt://stitcher:9002?mode=caller&latency=40", "--port", "8090",
+              "--preview-udp", "0.0.0.0:5200"]
     ports: ["8090:8090"]
     depends_on: [stitcher]
 

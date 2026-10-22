@@ -6,7 +6,8 @@
 set -euo pipefail
 source /app/scripts/common.sh
 
-exec ffmpeg -hide_banner -loglevel error -nostdin -i "$1" \
+# Low CPU priority: the live encode and stitching must never wait for an ad transcode.
+exec nice -n 15 ffmpeg -hide_banner -loglevel error -nostdin -i "$1" \
   -map 0:v:0 -map 0:a:0 \
   -vf "scale=${VIDEO_SIZE/x/:}:flags=bicubic,fps=${FPS},setsar=1" -af "aresample=48000" \
   "${ENC_ARGS[@]}" pipe:1

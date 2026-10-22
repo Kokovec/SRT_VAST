@@ -13,6 +13,10 @@
   user's session does, and ``/api/session`` tells the page who is signed in
   until when.
 * ``--tls-port`` adds an HTTPS listener: the hop from CloudFront to the host.
+* ``--preview-udp`` receives a copy of the stitcher's *incoming* stream and
+  re-encodes it to a small, low-bitrate preview (``/preview.ts``: 320x180,
+  15 fps, ~200 kb/s, no audio), so the page can show the pre-stitch feed next
+  to the output for a fraction of a second full stream.
 * ``/api/status`` reports how many streams are open and for how long nobody
   has watched; the host's idle watchdog stops the instance on it.
 
@@ -34,11 +38,12 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Callable
 
 from . import setup_logging
 from .auth import SESSION_COOKIE, AuthError, Identity, JwtVerifier, cookie_value
 from .transport import udp_receiver
-from .ts import PacketReader
+from .ts import PTS_HZ, PacketReader, find_pmt, get_pid, get_pts_dts, is_pusi, pts_diff, video_stream
 
 log = logging.getLogger("viewer")
 
@@ -98,12 +103,109 @@ class HubLogHandler(logging.Handler):
                           "logger": record.name, "msg": record.getMessage()})
 
 
-def pull_srt(url: str, video: Hub) -> None:
-    """Keep an SRT caller connected to the stitcher; publish whole TS packets."""
+class VideoClock:
+    """The first video PTS in each chunk of one transport stream."""
+
+    def __init__(self) -> None:
+        self._held: list = []  # packets until the PMT has been seen
+        self._vpid: int | None = None
+
+    def pts(self, packets) -> int | None:
+        first = None
+        for pkt in packets:
+            if self._vpid is None:
+                self._held.append(pkt)
+                pmt = find_pmt(self._held)
+                video = video_stream(pmt) if pmt else None
+                if video is not None:
+                    self._vpid, self._held = video.pid, []
+                elif len(self._held) > 2000:
+                    self._held = self._held[-200:]
+                continue
+            if first is None and get_pid(pkt) == self._vpid and is_pusi(pkt):
+                first = get_pts_dts(pkt)[0]
+        return first
+
+
+class StreamAligner:
+    """Holds back whichever feed is ahead, so both publish the same content time together.
+
+    The program feed and the incoming-stream preview carry the same timestamps
+    (the stitcher keeps the content timeline through ad breaks; the preview keeps
+    them with -copyts). For each program frame the aligner works out when the
+    preview delivers that same timestamp (extrapolating if it has not yet),
+    smooths the difference, and delays the earlier feed by it.
+    """
+
+    def __init__(self, hubs: dict[str, Hub], max_delay: float = 1.5, smoothing: float = 0.05,
+                 clock=time.monotonic, start: bool = True) -> None:
+        self.hubs = hubs
+        self.max_delay = max_delay
+        self.smoothing = smoothing
+        self.clock = clock
+        self.offset = 0.0  # seconds the preview delivers a given frame after the program feed
+        self._history: dict[str, collections.deque] = {k: collections.deque(maxlen=120) for k in hubs}
+        self._queues: dict[str, collections.deque] = {k: collections.deque() for k in hubs}
+        self._cond = threading.Condition()
+        if start:
+            threading.Thread(target=self._release, daemon=True, name="align").start()
+
+    def delay(self, name: str) -> float:
+        lag = self.offset if name == "main" else -self.offset
+        return min(self.max_delay, max(0.0, lag))
+
+    def offer(self, name: str, data: bytes, pts: int | None) -> None:
+        now = self.clock()
+        with self._cond:
+            if pts is not None:
+                self._history[name].append((pts, now))
+                if name == "main":
+                    self._measure(pts, now)
+            self._queues[name].append((now + self.delay(name), data))
+            self._cond.notify()
+
+    def _measure(self, pts: int, now: float) -> None:
+        preview = self._history.get("preview")
+        if not preview or len(preview) < 2 or now - preview[-1][1] > 2.0:
+            self.offset += self.smoothing * (0.0 - self.offset)  # no live preview: drift back to no delay
+            return
+        last_pts, last_t = preview[-1]
+        ahead = pts_diff(pts, last_pts)
+        if ahead >= 0:
+            when = last_t + ahead / PTS_HZ          # preview has not shown this frame yet
+        else:
+            older = [(p, t) for p, t in preview if pts_diff(p, pts) <= 0]
+            if not older:
+                return                               # older than the preview history
+            p0, t0 = older[-1]
+            when = t0 + pts_diff(pts, p0) / PTS_HZ
+        diff = when - now
+        if abs(diff) <= 5.0:                         # ignore jumps (a feed restarted)
+            self.offset += self.smoothing * (diff - self.offset)
+
+    def _release(self) -> None:
+        while True:
+            with self._cond:
+                while True:
+                    now = self.clock()
+                    due = []
+                    for name, queue in self._queues.items():
+                        while queue and queue[0][0] <= now:
+                            due.append((name, queue.popleft()[1]))
+                    if due:
+                        break
+                    heads = [q[0][0] for q in self._queues.values() if q]
+                    self._cond.wait(timeout=min(heads) - now if heads else 1.0)
+            for name, data in due:
+                self.hubs[name].publish(data)
+
+
+def pull_srt(url: str, publish: Callable[[bytes, int | None], None]) -> None:
+    """Keep an SRT caller connected to the stitcher; publish whole TS packets (with their video PTS)."""
     while True:
         proc = subprocess.Popen(["srt-live-transmit", "-q", "-a:no", url, "file://con"],
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        reader, connected, received = PacketReader(), False, 0
+        reader, clock, connected, received = PacketReader(), VideoClock(), False, 0
         while chunk := proc.stdout.read1(65536):
             packets = reader.feed(chunk)
             if not packets:
@@ -112,10 +214,42 @@ def pull_srt(url: str, video: Hub) -> None:
                 connected = True
                 log.info("monitor feed connected: %s", url)
             received += len(chunk)
-            video.publish(b"".join(packets))
+            publish(b"".join(packets), clock.pts(packets))
         proc.wait()
         if connected:
             log.warning("monitor feed lost after %.1f MB, reconnecting", received / 1e6)
+        time.sleep(1)
+
+
+PREVIEW_ENCODE = [
+    "-map", "0:v:0", "-an", "-sn", "-dn",
+    "-vf", "scale=320:180:flags=fast_bilinear,fps=15",
+    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "baseline",
+    "-g", "30", "-b:v", "200k", "-maxrate", "230k", "-bufsize", "230k",
+    "-f", "mpegts", "-muxdelay", "0", "-muxpreload", "0", "-flush_packets", "1", "pipe:1",
+]
+
+
+def run_preview(addr: str, publish: Callable[[bytes, int | None], None]) -> None:
+    """Re-encode the tapped incoming stream to a small preview; restart on any exit."""
+    host, _, port = addr.rpartition(":")
+    url = f"udp://{host or '0.0.0.0'}:{port}?fifo_size=50000&overrun_nonfatal=1&timeout=5000000"
+    while True:
+        # -copyts: keep the incoming timestamps, so preview and output share one timeline.
+        proc = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-copyts",
+                                 "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32768", "-analyzeduration", "0",
+                                 "-i", url, *PREVIEW_ENCODE], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        reader, clock, started = PacketReader(), VideoClock(), False
+        while chunk := proc.stdout.read1(65536):
+            packets = reader.feed(chunk)
+            if packets:
+                if not started:
+                    started = True
+                    log.info("incoming-stream preview running (udp %s)", addr)
+                publish(b"".join(packets), clock.pts(packets))
+        proc.wait()
+        if started:
+            log.warning("incoming-stream preview stopped (input gone?), restarting")
         time.sleep(1)
 
 
@@ -152,9 +286,11 @@ class Handler(BaseHTTPRequestHandler):
             self._file(WEB_DIR / "index.html", "text/html; charset=utf-8")
         elif path == "/api/session":
             self._json({"email": who.email, "expires": None if math.isinf(who.expires) else who.expires,
-                        "auth": self.server.verifier is not None})
+                        "auth": self.server.verifier is not None, "preview": self.server.preview is not None})
         elif path == "/live.ts":
-            self._live(who)
+            self._live(who, self.server.video, "watching")
+        elif path == "/preview.ts" and self.server.preview is not None:
+            self._live(who, self.server.preview, "previewing")
         elif path == "/events":
             self._events(who)
         else:
@@ -208,11 +344,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-    def _live(self, who: Identity) -> None:
-        hub = self.server.video
+    def _live(self, who: Identity, hub: Hub, what: str) -> None:
         q, _ = hub.subscribe()
         name = who.email or self.address_string()
-        log.info("viewer %s watching (%d now)", name, len(hub))
+        log.info("viewer %s %s (%d now)", name, what, len(hub))
         self._stream_headers("video/mp2t")
         try:
             while time.time() < who.expires:
@@ -261,10 +396,13 @@ class Handler(BaseHTTPRequestHandler):
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, video: Hub, events: Hub, verifier: JwtVerifier | None = None) -> None:
+    def __init__(self, addr, video: Hub, events: Hub, verifier: JwtVerifier | None = None,
+                 preview: Hub | None = None) -> None:
         super().__init__(addr, Handler)
         self.video = video
         self.events = events
+        self.preview = preview
+        self.aligner: StreamAligner | None = None
         self.verifier = verifier
         self.last_active = time.time()  # when the last stream closed (or the server started)
 
@@ -272,14 +410,17 @@ class ViewerServer(ThreadingHTTPServer):
         self.last_active = time.time()
 
     def status(self) -> dict:
-        open_streams = len(self.video) + len(self.events)
+        open_streams = len(self.video) + len(self.events) + (len(self.preview) if self.preview else 0)
         idle = 0.0 if open_streams else time.time() - self.last_active
-        return {"streams": open_streams, "watching": len(self.video), "idle_seconds": round(idle, 1)}
+        status = {"streams": open_streams, "watching": len(self.video), "idle_seconds": round(idle, 1)}
+        if self.aligner is not None:
+            status["preview_lag_ms"] = round(self.aligner.offset * 1000)
+        return status
 
 
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="Web monitor for the stitched output and event log")
-    p.add_argument("--srt", default="srt://stitcher:9002?mode=caller&latency=200",
+    p.add_argument("--srt", default="srt://stitcher:9002?mode=caller&latency=40",
                    help="stitcher monitor output to pull")
     p.add_argument("--events-udp", default="0.0.0.0:5100", help="where components send JSON log events")
     p.add_argument("--host", default="0.0.0.0")
@@ -289,6 +430,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="token issuer, e.g. https://cognito-idp.us-west-2.amazonaws.com/<pool id>; enables sign-in")
     p.add_argument("--auth-audience", default=os.environ.get("AUTH_AUDIENCE"),
                    help="expected token audience (the Cognito app client ID)")
+    p.add_argument("--preview-udp", default=os.environ.get("PREVIEW_UDP", ""),
+                   help="receive the stitcher's incoming-stream tap here (e.g. 0.0.0.0:5200) and serve /preview.ts")
     p.add_argument("--tls-port", type=int, default=int(os.environ.get("TLS_PORT", 0)),
                    help="also serve HTTPS on this port (the CloudFront origin)")
     p.add_argument("--tls-cert", default=os.environ.get("TLS_CERT"), help="certificate chain (PEM)")
@@ -305,14 +448,26 @@ def main(argv: list[str] | None = None) -> None:
     video = Hub(maxsize=2000)            # ~20 s of 2.6 Mb/s in 1316-byte chunks
     events = Hub(maxsize=1000, backlog=args.backlog)
     logging.getLogger().addHandler(HubLogHandler(events))
-    threading.Thread(target=pull_srt, args=(args.srt, video), daemon=True, name="srt").start()
+    preview, aligner = None, None
+    if args.preview_udp:
+        preview = Hub(maxsize=500)       # ~0.2 Mb/s: generous
+        aligner = StreamAligner({"main": video, "preview": preview})
+        publish_main = lambda data, pts: aligner.offer("main", data, pts)        # noqa: E731
+        publish_preview = lambda data, pts: aligner.offer("preview", data, pts)  # noqa: E731
+        threading.Thread(target=run_preview, args=(args.preview_udp, publish_preview), daemon=True,
+                         name="preview").start()
+    else:
+        publish_main = lambda data, pts: video.publish(data)  # noqa: E731
+    threading.Thread(target=pull_srt, args=(args.srt, publish_main), daemon=True, name="srt").start()
     threading.Thread(target=receive_events, args=(args.events_udp, events), daemon=True, name="events").start()
-    server = ViewerServer((args.host, args.port), video, events, verifier)
+    server = ViewerServer((args.host, args.port), video, events, verifier, preview)
+    server.aligner = aligner
     if args.tls_port:
         context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(args.tls_cert, args.tls_key)
-        tls = ViewerServer((args.host, args.tls_port), video, events, verifier)
+        tls = ViewerServer((args.host, args.tls_port), video, events, verifier, preview)
+        tls.aligner = aligner
         tls.socket = context.wrap_socket(tls.socket, server_side=True)
         tls.last_active = server.last_active
         server.touch = tls.touch = _shared_touch(server, tls)
