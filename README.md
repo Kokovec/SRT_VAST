@@ -19,7 +19,7 @@ the returned ad into the outgoing **MPEG-TS** at the packet level.
 
 | Component | Where | What it does |
 |---|---|---|
-| SRT source | [scripts/source.sh](scripts/source.sh), [srtvast/source.py](srtvast/source.py) | ffmpeg test pattern, **conditioned**: an IDR is forced on every splice-out and splice-in frame of the break schedule → adds an SCTE-35 PID (0x1F4) to the PMT and inserts `splice_insert` (or `time_signal`) cues 6/4/2 s ahead of each break, on whole frames → SRT caller |
+| SRT source | [scripts/source.sh](scripts/source.sh), [srtvast/source.py](srtvast/source.py) | ffmpeg test pattern, **conditioned**: an IDR is forced on every splice-out and splice-in frame of the break schedule → adds an SCTE-35 PID (0x1F4) to the PMT and inserts `splice_insert` (or `time_signal`) cues 15/10/5/2 s ahead of each break (`CUE_PREROLL`), on whole frames → SRT caller |
 | SRT receiver | [scripts/stitcher.sh](scripts/stitcher.sh) | `srt-live-transmit` listener on :9000, hands TS to Python over loopback UDP |
 | SCTE-35 detector | [srtvast/scte35.py](srtvast/scte35.py), `Stitcher._on_splice_info` | Finds the 0x86 PID from the PMT, reassembles and CRC-checks sections, normalises `splice_insert` and `time_signal`+segmentation descriptors into out/in/cancel cues, applies `pts_adjustment`, dedupes repeats |
 | VAST integrator | [srtvast/vast.py](srtvast/vast.py), `VastPodLoader` | On a cue, requests VAST from the ADS, follows wrappers, orders the pod by `sequence`, picks HLS media (falling back to `video/MP2T`), downloads it before the splice point, fires impression / start / quartile / complete / error beacons |
@@ -40,6 +40,7 @@ docker compose up --build
 - 1st break 21.5 s in (deliberately off the 2 s GOP grid), then every 60 s, 30 s long (`BREAK_*` in [docker-compose.yml](docker-compose.yml)). The second break gets a 25 s pod and is padded with 5 s of slate.
 - Watch the `stitcher` and `ads` logs: cue detected → VAST request → pod ready → break armed (splice frames) → `>>> SPLICE OUT` → ad starts + beacons → `<<< SPLICE IN` → break summary (frames, slate, audio grid shift per ad).
 - Output: `out/stitched.ts` (written by the stitcher) and `out/received.ts` (pulled back over SRT by `recorder`).
+- **Web monitor: http://localhost:8090.** It shows the stitched output (pulled over SRT from the stitcher's second egress, `:9002`, and played as MPEG-TS with mpegts.js) next to a live log of every component's events: cues, VAST, splices and beacons. It also has an on-air badge (PROGRAM / AD BREAK n, current ad, break progress) and a slider that delays events to match the player's latency. Components send their log records as JSON over UDP when `EVENTS_UDP` is set ([srtvast/viewer.py](srtvast/viewer.py), [srtvast/web/index.html](srtvast/web/index.html)).
 - Live view: `srt://localhost:9001` in VLC/ffplay (stop `recorder` first; the listener takes one caller). From Windows, UDP port forwarding into WSL2 may need mirrored networking.
 
 Check a recording:
@@ -66,6 +67,32 @@ source that owns its time: frame-accurate out/in, splice-out mid-GOP, cue betwee
 frames, ad longer than the break (cut on the frame, no `complete` beacon), short
 pod padded with slate, unconditioned content (held to the next IDR), bit-exact
 passthrough outside breaks, ad decision failure, and `time_signal` cues.
+
+## SSAI creative flow (mezzanine → conform → cache)
+
+By default the mock ADS answers like an SSAI-integrated ad server: each ad's
+`<MediaFiles>` carries only a VAST 4 **`<Mezzanine>`**. That is a 1080p25 High-profile
+master with B-frames and 44.1 kHz audio, deliberately unlike the 720p30 stream. On a
+cue the stitcher:
+
+1. requests VAST and reads the pod;
+2. **fetches each mezzanine** (`GET /mez/<id>.mp4`) and **conforms** it to the stream
+   profile with [scripts/conform.sh](scripts/conform.sh): scale, frame rate, fixed GOP,
+   no B-frames, 48 kHz AAC and the stream's PIDs, all taken from
+   [scripts/common.sh](scripts/common.sh), the content's own encoder settings;
+3. **caches** the conformed creative per mezzanine URL, so later breaks that use it
+   only log `cache hit`. Ads in a pod are conformed in parallel, and a transcode
+   already running for another break is shared, not repeated;
+4. splices as usual once every ad is ready.
+
+A 15 s creative conforms in about 3 s on 8 cores, and the heavy 20 s ad4 master in about 9 s, both inside the 15 s cue preroll (`CUE_PREROLL`). When a
+transcode isn't done by the splice point, the break stays on program and the transcode
+still completes into the cache. That is the "first impression miss" real SSAI systems
+have. The aired ad shows a `mezzanine 1920x1080 25p` corner label, so you can see the
+conformed master on air.
+
+`ADS_DELIVERY=streaming` (ready-to-splice HLS) or `both` on the `ads` service
+switches the VAST back. The stitcher prefers the mezzanine when it has `--conform`.
 
 ## How the splice works
 

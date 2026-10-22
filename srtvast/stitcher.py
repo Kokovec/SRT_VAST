@@ -40,9 +40,14 @@ import argparse
 import logging
 import random
 import signal
+import subprocess
 import sys
+import tempfile
 import threading
+import time
+import urllib.parse
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -167,12 +172,31 @@ def build_pod(media: list[tuple[vast.Ad | None, bytes]], content_streams: dict[i
 
 
 class VastPodLoader:
-    """Default pod loader: VAST request -> pick media -> download (HLS is transmuxed to TS)."""
+    """Default pod loader: the SSAI "ad decision -> creative" leg.
 
-    def __init__(self, url_template: str, timeout: float = 3.0) -> None:
+    VAST request, then per ad, in parallel:
+
+    * a VAST 4 ``<Mezzanine>`` (with ``conform_cmd`` set): fetch the master and
+      transcode it to the stream's profile. The result is cached per creative
+      (mezzanine URL), so only the first break that uses a creative pays for
+      the transcode; a transcode still running when another break asks for the
+      same creative is shared, not repeated;
+    * otherwise a ready-to-splice MediaFile: HLS (transmuxed to TS) or MPEG-TS,
+      downloaded and cached.
+
+    The call returns when every ad is ready. If that is after the splice point,
+    the stitcher keeps the break on content; the transcodes still finish and
+    land in the cache for the next break.
+    """
+
+    def __init__(self, url_template: str, timeout: float = 3.0, conform_cmd: str | None = None,
+                 workers: int = 4) -> None:
         self.url_template = url_template
         self.timeout = timeout
-        self._cache: dict[str, bytes] = {}
+        self.conform_cmd = conform_cmd
+        self._pool = ThreadPoolExecutor(workers, thread_name_prefix="creative")
+        self._jobs: dict[str, Future] = {}   # media/mezzanine URL -> TS bytes (done = cached)
+        self._lock = threading.Lock()
 
     def __call__(self, brk: "Break", content_streams: dict[int, int]) -> Pod:
         seconds = (brk.duration or 30 * PTS_HZ) / PTS_HZ
@@ -182,23 +206,72 @@ class VastPodLoader:
         ads = vast.fetch_ads(url, timeout=self.timeout)
         if not ads:
             raise LookupError("VAST response had no ads")
-        media = []
+        jobs = []
         for ad in ads:
-            mf = ad.pick_media()
-            if mf is None:
-                log.warning("ad %s has no HLS or MPEG-TS media file, skipping", ad.ad_id)
+            job = self._job(ad, brk.event_id)
+            if job is None:
+                log.warning("ad %s has no mezzanine or ready-to-splice media file, skipping", ad.ad_id)
                 vast.fire(ad.errors, error_code=403)
-                continue
-            if mf.url not in self._cache:
-                if hls.is_hls(mf.mime_type, mf.url):
-                    self._cache[mf.url] = hls.load_ts(mf.url, lambda u: vast.http_get(u, self.timeout * 4))
-                else:
-                    self._cache[mf.url] = vast.http_get(mf.url, self.timeout * 4)
-                    log.info("downloaded %s (%d bytes)", mf.url, len(self._cache[mf.url]))
-            media.append((ad, self._cache[mf.url]))
+            else:
+                jobs.append((ad, job))
+        media = []
+        for ad, job in jobs:
+            try:
+                media.append((ad, job.result()))
+            except Exception as exc:  # noqa: BLE001 - drop this ad, keep the rest of the pod
+                log.warning("ad %s: creative not available: %s", ad.ad_id, exc)
+                vast.fire(ad.errors, error_code=405)
         if not media:
             raise LookupError("no playable ads in VAST response")
         return build_pod(media, content_streams)
+
+    def _job(self, ad: vast.Ad, event_id: int) -> Future | None:
+        if ad.mezzanine and self.conform_cmd:
+            source, work = ad.mezzanine[0], self._conform
+        else:
+            source, work = ad.pick_media(), self._download
+            if source is None:
+                return None
+        name = _creative_name(source.url)
+        with self._lock:
+            job = self._jobs.get(source.url)
+            if job is not None and not (job.done() and job.exception()):
+                if job.done():
+                    log.info("break %d: creative %s cache hit", event_id, name)
+                else:
+                    log.info("break %d: creative %s already being prepared, waiting for it", event_id, name)
+                return job
+            job = self._pool.submit(work, source, name, event_id)
+            self._jobs[source.url] = job
+            return job
+
+    def _conform(self, mez: vast.MediaFile, name: str, event_id: int) -> bytes:
+        started = time.monotonic()
+        data = vast.http_get(mez.url, self.timeout * 10)
+        fetched = time.monotonic()
+        log.info("break %d: mezzanine %s fetched, %.1f MB %s %dx%d, in %.2fs", event_id, name, len(data) / 1e6,
+                 mez.mime_type or "?", mez.width, mez.height, fetched - started)
+        with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+            f.write(data)
+            f.flush()
+            proc = subprocess.run([self.conform_cmd, f.name], capture_output=True, timeout=300)
+        if proc.returncode != 0 or not proc.stdout:
+            raise RuntimeError(f"conform failed ({proc.returncode}): {proc.stderr.decode(errors='replace')[-300:]}")
+        log.info("break %d: creative %s conformed to the stream profile in %.2fs (%.1f MB TS), cached",
+                 event_id, name, time.monotonic() - fetched, len(proc.stdout) / 1e6)
+        return proc.stdout
+
+    def _download(self, mf: vast.MediaFile, name: str, event_id: int) -> bytes:
+        if hls.is_hls(mf.mime_type, mf.url):
+            return hls.load_ts(mf.url, lambda u: vast.http_get(u, self.timeout * 4))
+        data = vast.http_get(mf.url, self.timeout * 4)
+        log.info("break %d: downloaded %s (%d bytes)", event_id, mf.url, len(data))
+        return data
+
+
+def _creative_name(url: str) -> str:
+    path = urllib.parse.urlsplit(url).path.rstrip("/")
+    return path.rsplit("/", 1)[-1] or url
 
 
 # --------------------------------------------------------------------------
@@ -859,11 +932,14 @@ class Stitcher:
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(description="SCTE-35 / VAST MPEG-TS ad stitcher")
     p.add_argument("--input-udp", default="0.0.0.0:5001", help="where srt-live-transmit delivers the content")
-    p.add_argument("--output-udp", default="127.0.0.1:5002", help="where to send the stitched stream")
+    p.add_argument("--output-udp", default="127.0.0.1:5002",
+                   help="where to send the stitched stream (comma-separated for several)")
     p.add_argument("--record", help="also write the stitched stream to this file")
     p.add_argument("--ads-url", required=True,
                    help="VAST tag template; {duration}, {event_id}, {cachebuster} are filled in")
     p.add_argument("--slate", help="MPEG-TS slate (encoded like the content) used to fill short pods")
+    p.add_argument("--conform", help="command that transcodes a mezzanine file to the stream profile "
+                                     "(MPEG-TS on stdout); enables VAST <Mezzanine> handling")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     setup_logging(args.log_level)
@@ -874,23 +950,25 @@ def main(argv: list[str] | None = None) -> None:
             slate = f.read()
         log.info("slate %s (%d bytes)", args.slate, len(slate))
     sock = udp_receiver(args.input_udp)
-    out = UdpPacketWriter(args.output_udp)
+    outs = [UdpPacketWriter(addr) for addr in args.output_udp.split(",") if addr]
     record = open(args.record, "wb") if args.record else None
 
     def write(pkt: bytearray) -> None:
-        out.write(pkt)
+        for out in outs:
+            out.write(pkt)
         if record:
             record.write(pkt)
 
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    stitcher = Stitcher(write, VastPodLoader(args.ads_url), slate=slate)
+    stitcher = Stitcher(write, VastPodLoader(args.ads_url, conform_cmd=args.conform), slate=slate)
     reader = PacketReader()
     log.info("listening on udp %s, output udp %s, record %s", args.input_udp, args.output_udp, args.record)
     try:
         while True:
             for pkt in reader.feed(sock.recv(65536)):
                 stitcher.feed(pkt)
-            out.flush()
+            for out in outs:
+                out.flush()
     except KeyboardInterrupt:
         pass
     finally:

@@ -25,4 +25,5 @@ ffmpeg -hide_banner -loglevel warning -re \
   "${ENC_ARGS[@]}" -force_key_frames "$FORCE_KEYS" -forced-idr 1 -flush_packets 1 pipe:1 \
 | python -m srtvast.source --udp 127.0.0.1:5000 \
     --first-break "$BREAK_FIRST" --interval "$BREAK_INTERVAL" \
-    --duration "$BREAK_DURATION" --mode "${CUE_MODE:-splice_insert}"
+    --duration "$BREAK_DURATION" --mode "${CUE_MODE:-splice_insert}" \
+    --preroll "${CUE_PREROLL:-15,10,5,2}"

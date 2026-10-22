@@ -30,7 +30,7 @@ REGISTRATION_CUEI = bytes([0x05, 0x04]) + b"CUEI"
 class CueInjector:
     def __init__(self, write, scte35_pid: int = 0x1F4, first_break: float = 20.0,
                  interval: float = 60.0, duration: float = 30.0,
-                 prerolls: tuple[float, ...] = (6.0, 4.0, 2.0), mode: str = "splice_insert",
+                 prerolls: tuple[float, ...] = (15.0, 10.0, 5.0, 2.0), mode: str = "splice_insert",
                  first_event_id: int = 1001) -> None:
         self.write = write
         self.scte35_pid = scte35_pid
@@ -156,7 +156,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--first-break", type=float, default=20.0, help="seconds into the stream")
     p.add_argument("--interval", type=float, default=60.0, help="seconds between breaks")
     p.add_argument("--duration", type=float, default=30.0, help="break duration, seconds")
-    p.add_argument("--preroll", default="6,4,2", help="send the cue this many seconds ahead (repeats)")
+    p.add_argument("--preroll", default="15,10,5,2", help="send the cue this many seconds ahead (repeats)")
     p.add_argument("--mode", choices=("splice_insert", "time_signal"), default="splice_insert")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
