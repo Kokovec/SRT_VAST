@@ -98,9 +98,17 @@ def scan_library(media_dir: Path) -> list[Creative]:
         mez = probe_mezzanine(mez_path) if mez_path.exists() else None
         library.append(Creative(path.stem, title, path, round(measure_duration(path.read_bytes()), 3),
                                 hls=hls, mezzanine=mez))
-        log.info("creative %-5s %6.3fs  %-4s %s%s", path.stem, library[-1].duration, "HLS" if hls else "TS", title,
-                 f"  (mezzanine {mez.width}x{mez.height}@{mez.fps} {mez.codec}, {mez.size / 1e6:.1f} MB)" if mez else "")
     return library
+
+
+def served_as(c: Creative, delivery: str) -> str:
+    """What the VAST for this creative carries under ``delivery`` (see ``_media_files``)."""
+    ready = "HLS" if c.hls else "MPEG-TS"
+    if c.mezzanine is None or delivery == "streaming":
+        return f"{ready} (ready to splice)"
+    m = c.mezzanine
+    mez = f"mezzanine {m.width}x{m.height}@{m.fps} {m.codec}, {m.size / 1e6:.1f} MB"
+    return mez if delivery == "mezzanine" else f"{mez} + {ready}"
 
 
 def select_pod(library: list[Creative], duration: float, start: int) -> list[Creative]:
@@ -311,6 +319,9 @@ def main(argv: list[str] | None = None) -> None:
     if not library:
         log.warning("no creatives in %s; every request will be a no-fill", args.media_dir)
     server = AdServer((args.host, args.port), library, args.public_url, args.media_dir, args.delivery)
+    for c in library:
+        log.info("creative %-5s %6.3fs  %-15s VAST delivers: %s", c.ad_id, c.duration, c.title,
+                 served_as(c, args.delivery))
     log.info("mock ADS on %s:%d (public %s, delivery %s)", args.host, args.port, args.public_url, args.delivery)
     server.serve_forever()
 

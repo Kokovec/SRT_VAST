@@ -76,3 +76,13 @@ class ConformLoaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServedAsTests(unittest.TestCase):
+    def test_log_says_what_vast_carries(self):
+        from srtvast.ads import served_as
+        c = creative(hls=True)
+        self.assertTrue(served_as(c, "mezzanine").startswith("mezzanine 1920x1080@25"))
+        self.assertEqual(served_as(c, "streaming"), "HLS (ready to splice)")
+        self.assertTrue(served_as(c, "both").endswith("+ HLS"))
+        self.assertEqual(served_as(Creative("x", "X", Path("x.ts"), 1.0), "mezzanine"), "MPEG-TS (ready to splice)")
