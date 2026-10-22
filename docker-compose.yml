@@ -10,6 +10,8 @@ services:
     <<: *app
     build: .
     command: /app/scripts/ads.sh
+    environment:
+      EVENTS_UDP: viewer:5100
     ports: ["8080:8080"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
@@ -20,8 +22,10 @@ services:
     <<: *app
     command: /app/scripts/stitcher.sh
     environment:
+      EVENTS_UDP: viewer:5100
       # Use /wrapper instead of /vast to exercise VAST wrapper resolution.
       ADS_URL: "http://ads:8080/vast?dur={duration}&event={event_id}&cb={cachebuster}"
+      TAP_UDP: viewer:5200     # copy of the incoming stream for the viewer's pre-stitch preview
     ports: ["9001:9001/udp"]
     volumes: ["./out:/out"]
     depends_on:
@@ -31,10 +35,21 @@ services:
     <<: *app
     command: /app/scripts/source.sh
     environment:
+      EVENTS_UDP: viewer:5100
       BREAK_FIRST: 21.5     # seconds into the stream (off the 2 s GOP grid on purpose)
       BREAK_INTERVAL: 60
       BREAK_DURATION: 30
       CUE_MODE: splice_insert   # or time_signal
+      CUE_PREROLL: "15,10,5,2"  # first cue 15 s before the splice, repeated at 10, 5 and 2 s
+    depends_on: [stitcher, viewer]
+
+  # Web monitor: stitched output (pulled over SRT from :9002) + live event log.
+  # Open http://localhost:8090
+  viewer:
+    <<: *app
+    command: ["python", "-m", "srtvast.viewer", "--srt", "srt://stitcher:9002?mode=caller&latency=40", "--port", "8090",
+              "--preview-udp", "0.0.0.0:5200"]
+    ports: ["8090:8090"]
     depends_on: [stitcher]
 
   # Pulls the stitched SRT output, proving the SRT egress leg works.

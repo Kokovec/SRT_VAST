@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRT VAST Monitor</title>
+<style>
+  :root {
+    --bg: #0d1014;
+    --panel: #151a21;
+    --panel-2: #1b222b;
+    --line: #262f3a;
+    --text: #d9e1ea;
+    --muted: #7d8a99;
+    --program: #2fbf71;
+    --ad: #f0a732;
+    --scte: #4cc3ff;
+    --vast: #b48cff;
+    --warn: #ffcc4d;
+    --error: #ff6b6b;
+    /* chart series (validated for CVD/contrast against --panel) */
+    --series-1: #3987e5;   /* expected (cue) */
+    --series-2: #d95926;   /* actual (stitched) */
+    --series-3: #199e70;   /* splice-out deviation */
+    --series-4: #c98500;   /* splice-in deviation */
+    --grid: #232b35;
+    --axis: #3a4552;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }  /* the hidden attribute must beat component display rules */
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.4 var(--sans); }
+
+  .app { display: grid; grid-template-columns: minmax(360px, 38%) 1fr; grid-template-rows: auto 1fr; height: 100vh; }
+  header { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: .02em; }
+  .conn { display: flex; gap: 14px; margin-left: auto; color: var(--muted); font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--error); margin-right: 6px; }
+  .dot.ok { background: var(--program); }
+  .session { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .session b { color: var(--text); font-weight: 600; }
+  .session a { color: var(--text); text-decoration: none; border: 1px solid var(--line); border-radius: 6px;
+               padding: 3px 10px; background: var(--panel-2); }
+  .session a:hover { border-color: var(--muted); }
+
+  /* ---- log pane ---- */
+  .log-pane { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: var(--panel); }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .chip { font: 12px var(--sans); color: var(--muted); background: var(--panel-2); border: 1px solid var(--line);
+          border-radius: 999px; padding: 3px 10px; cursor: pointer; user-select: none; }
+  .chip[aria-pressed="true"] { color: var(--text); border-color: var(--muted); }
+  .chip .sw { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  .toolbar input { flex: 1 1 120px; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+                   border-radius: 6px; padding: 4px 8px; font: 12px var(--sans); }
+  .toolbar button { font: 12px var(--sans); color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+                    border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  #log { flex: 1; overflow-y: auto; font: 12px/1.5 var(--mono); padding: 4px 0; }
+  .row { display: grid; grid-template-columns: 64px 64px 1fr; gap: 8px; padding: 1px 10px; border-left: 3px solid transparent; }
+  .row:hover { background: var(--panel-2); }
+  .row .time { color: var(--muted); }
+  .row .src { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; padding-top: 2px; }
+  .row .msg { white-space: pre-wrap; word-break: break-word; }
+  .row.scte .msg { color: var(--scte); }
+  .row.vast .msg { color: var(--vast); }
+  .row.ad .msg { color: var(--ad); }
+  .row.splice-out { border-left-color: var(--ad); background: rgba(240, 167, 50, .10); font-weight: 700; }
+  .row.splice-out .msg { color: var(--ad); }
+  .row.splice-in { border-left-color: var(--program); background: rgba(47, 191, 113, .10); font-weight: 700; }
+  .row.splice-in .msg { color: var(--program); }
+  .row.WARNING .msg { color: var(--warn); }
+  .row.ERROR .msg { color: var(--error); }
+  .jump { display: none; margin: 0 10px 8px; }
+  .jump.show { display: block; }
+
+  /* ---- video pane ---- */
+  .video-pane { display: flex; flex-direction: column; gap: 12px; padding: 16px; min-width: 0; min-height: 0; overflow: auto; }
+  .stage { position: relative; background: #000; border-radius: 8px; overflow: hidden; aspect-ratio: 16 / 9; width: 100%;
+           max-height: calc(100vh - 520px); min-height: 240px; margin: 0 auto; border: 2px solid var(--program); transition: border-color .3s; }
+  .stage.in-ad { border-color: var(--ad); }
+  video { width: 100%; height: 100%; display: block; background: #000; }
+  .badge { position: absolute; top: 12px; left: 12px; display: flex; flex-direction: column; gap: 4px;
+           background: rgba(0, 0, 0, .72); border-radius: 6px; padding: 8px 12px; min-width: 200px; pointer-events: none; }
+  .badge .state { font-weight: 800; letter-spacing: .08em; font-size: 13px; color: var(--program); }
+  .stage.in-ad .badge .state { color: var(--ad); }
+  .badge .detail { font-size: 12px; color: var(--text); }
+  .bar { height: 3px; background: rgba(255, 255, 255, .15); border-radius: 2px; overflow: hidden; display: none; }
+  .bar > div { height: 100%; width: 0; background: var(--ad); }
+  .stage.in-ad .bar { display: block; }
+  .overlay-msg { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 14px; pointer-events: none; }
+  /* picture-in-picture: the incoming (pre-stitch) feed */
+  .pip { position: absolute; top: 12px; right: 12px; width: min(26%, 320px); aspect-ratio: 16 / 9; background: #000;
+         border: 2px solid var(--scte); border-radius: 6px; overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,.5); }
+  .pip video { width: 100%; height: 100%; display: block; }
+  .pip .pip-label { position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 8px; font-size: 11px; color: #fff;
+                    background: linear-gradient(transparent, rgba(0,0,0,.8)); }
+  .pip .pip-msg { position: absolute; inset: 0; display: grid; place-items: center; font-size: 11px; color: var(--muted); }
+  .pip-btn { position: absolute; top: 12px; right: 12px; font: 12px var(--sans); color: #fff; background: rgba(0,0,0,.7);
+             border: 1px solid rgba(255,255,255,.3); border-radius: 6px; padding: 4px 8px; cursor: pointer; z-index: 2; }
+  .pip .pip-btn { top: 4px; right: 4px; padding: 0 6px; line-height: 18px; }
+  .unmute { position: absolute; right: 12px; bottom: 12px; font: 12px var(--sans); color: #fff; background: rgba(0, 0, 0, .7);
+            border: 1px solid rgba(255, 255, 255, .3); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .stat .v { font: 600 15px var(--mono); margin-top: 2px; }
+  .sync { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+  .sync input { width: 160px; }
+
+  /* ---- splice timing charts ---- */
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card h2 { font-size: 13px; font-weight: 600; margin: 0; }
+  .card .sub { color: var(--muted); font-size: 12px; margin: 2px 0 10px; }
+  .charts { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+  .chart { margin: 0; min-width: 0; }
+  .chart figcaption { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: 12px; color: var(--text); margin-bottom: 4px; }
+  .chart figcaption .t { font-weight: 600; margin-right: 4px; }
+  .key { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .key svg { display: block; }
+  .plot { position: relative; width: 100%; }
+  .plot svg { display: block; width: 100%; overflow: visible; }
+  .plot text { font: 11px var(--sans); fill: var(--muted); font-variant-numeric: tabular-nums; }
+  .plot .row-label { fill: var(--text); font-size: 12px; }
+  .plot .hit { fill: transparent; cursor: default; outline: none; }
+  .plot .hit:hover, .plot .hit:focus-visible { fill: rgba(255, 255, 255, .05); }
+  .empty { color: var(--muted); font-size: 12px; padding: 18px 0; }
+  .tip { position: fixed; z-index: 10; pointer-events: none; background: #0b0e12; border: 1px solid var(--axis);
+         border-radius: 6px; padding: 8px 10px; font-size: 12px; min-width: 210px; display: none; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+  .tip .h { color: var(--muted); margin-bottom: 4px; }
+  .tip .r { display: grid; grid-template-columns: 14px auto 1fr; gap: 6px; align-items: center; }
+  .tip .r b { font: 600 12px var(--mono); }
+  .tip .r span:last-child { color: var(--muted); text-align: right; }
+  .tip .lk { width: 12px; height: 2px; border-radius: 1px; }
+  details.tbl { margin-top: 8px; }
+  details.tbl summary { color: var(--muted); font-size: 12px; cursor: pointer; }
+  details.tbl table { width: 100%; border-collapse: collapse; margin-top: 6px; font: 12px var(--mono); font-variant-numeric: tabular-nums; }
+  details.tbl th, details.tbl td { text-align: right; padding: 3px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  details.tbl th:first-child, details.tbl td:first-child { text-align: left; }
+  details.tbl th { color: var(--muted); font: 600 11px var(--sans); }
+  .tbl-wrap { overflow-x: auto; }
+
+  @media (max-width: 1100px) { .charts { grid-template-columns: 1fr; } }
+
+  @media (max-width: 860px) {
+    .app { grid-template-columns: 1fr; grid-template-rows: auto auto 1fr; height: auto; min-height: 100vh; }
+    .video-pane { order: 1; padding: 12px 16px; }
+    .log-pane { order: 2; border-right: 0; border-top: 1px solid var(--line); height: 60vh; }
+    .stage { max-height: none; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>SRT VAST · stitcher monitor</h1>
+    <div class="conn">
+      <span><span class="dot" id="dot-video"></span>video</span>
+      <span><span class="dot" id="dot-events"></span>events</span>
+    </div>
+    <div class="session" id="session" hidden>
+      <span><b id="who"></b></span>
+      <span>session ends in <b id="session-left">–</b></span>
+      <a href="/_auth/logout">Log out</a>
+    </div>
+  </header>
+
+  <section class="log-pane" aria-label="Event log">
+    <div class="toolbar" id="filters">
+      <span class="chip" data-group="source" aria-pressed="true"><span class="sw" style="background:var(--scte)"></span>source</span>
+      <span class="chip" data-group="stitcher" aria-pressed="true"><span class="sw" style="background:var(--ad)"></span>stitcher</span>
+      <span class="chip" data-group="ads" aria-pressed="true"><span class="sw" style="background:var(--vast)"></span>ADS</span>
+      <span class="chip" data-group="viewer" aria-pressed="false"><span class="sw" style="background:var(--muted)"></span>viewer</span>
+    </div>
+    <div class="toolbar">
+      <input id="search" type="search" placeholder="Filter text, e.g. break 1002">
+      <button id="clear" type="button">Clear</button>
+    </div>
+    <div id="log" role="log" aria-live="polite"></div>
+    <button class="toolbar jump" id="jump" type="button">↓ New events, scroll to latest</button>
+  </section>
+
+  <section class="video-pane" aria-label="Stitched output">
+    <div class="stage" id="stage">
+      <video id="video" muted autoplay playsinline></video>
+      <div class="overlay-msg" id="overlay">Connecting to the stitcher output…</div>
+      <div class="badge">
+        <div class="state" id="state">PROGRAM</div>
+        <div class="detail" id="detail">Waiting for events</div>
+        <div class="bar"><div id="progress"></div></div>
+      </div>
+      <div class="pip" id="pip" hidden>
+        <video id="pip-video" muted autoplay playsinline></video>
+        <div class="pip-msg" id="pip-msg">Connecting…</div>
+        <div class="pip-label">Incoming (pre-stitch)</div>
+        <button class="pip-btn" id="pip-hide" type="button" aria-label="Hide incoming preview" title="Hide">×</button>
+      </div>
+      <button class="pip-btn" id="pip-show" type="button" hidden>Show incoming</button>
+      <button class="unmute" id="unmute" type="button">🔇 Unmute</button>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="k">Next break</div><div class="v" id="s-next">–</div></div>
+      <div class="stat"><div class="k">Breaks played</div><div class="v" id="s-breaks">0</div></div>
+      <div class="stat"><div class="k">Player buffer</div><div class="v" id="s-buffer">–</div></div>
+      <div class="stat"><div class="k">Bitrate</div><div class="v" id="s-rate">–</div></div>
+      <div class="stat"><div class="k">Resolution</div><div class="v" id="s-res">–</div></div>
+      <div class="stat"><div class="k">Dropped frames</div><div class="v" id="s-drop">–</div></div>
+    </div>
+    <label class="sync">
+      Delay events to match the video
+      <input id="delay" type="range" min="0" max="5" step="0.1" value="0">
+      <span id="delay-v">0.0 s</span>
+    </label>
+
+    <section class="card" aria-labelledby="splice-title">
+      <h2 id="splice-title">Splice timing</h2>
+      <p class="sub">Where each break was signalled by its SCTE-35 cue, against where the stitcher actually spliced the ad in and out of the output (content PTS)</p>
+      <div class="charts">
+        <figure class="chart">
+          <figcaption>
+            <span class="t">Break timeline</span>
+            <span class="key"><svg width="16" height="8"><rect width="16" height="8" rx="2" fill="var(--series-1)"/></svg>Expected (cue)</span>
+            <span class="key"><svg width="16" height="8"><rect width="16" height="8" rx="2" fill="var(--series-2)"/></svg>Actual (stitched)</span>
+          </figcaption>
+          <div class="plot" id="tl"></div>
+        </figure>
+        <figure class="chart">
+          <figcaption>
+            <span class="t">Splice accuracy</span>
+            <span class="key"><svg width="10" height="10"><circle cx="5" cy="5" r="4" fill="var(--series-3)"/></svg>Splice-out</span>
+            <span class="key"><svg width="10" height="10"><path d="M5 0.5 9.5 5 5 9.5 0.5 5Z" fill="var(--series-4)"/></svg>Splice-in</span>
+            <span class="key">actual − expected, ms</span>
+          </figcaption>
+          <div class="plot" id="acc"></div>
+        </figure>
+      </div>
+      <details class="tbl">
+        <summary>Show as table</summary>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Break</th><th>Expected out</th><th>Actual out</th><th>Δ out</th><th>Expected in</th><th>Actual in</th><th>Δ in</th><th>Status</th></tr></thead>
+            <tbody id="splice-rows"></tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+  </section>
+  <div class="tip" id="tip" role="tooltip"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+<script>
+(() => {
+  "use strict";
+  const $ = (id) => document.getElementById(id);
+  const MAX_ROWS = 3000;
+
+  // ------------------------------------------------------------------ log
+  const logEl = $("log");
+  const enabled = new Set(["source", "stitcher", "ads"]);
+  let query = "";
+  let follow = true;
+  let delayMs = Number(localStorageGet("delay") || 0) * 1000;
+
+  function localStorageGet(k) { try { return localStorage.getItem("srtvast." + k); } catch { return null; } }
+  function localStorageSet(k, v) { try { localStorage.setItem("srtvast." + k, v); } catch { /* private mode */ } }
+
+  function groupOf(ev) {
+    const l = ev.logger || "";
+    if (l === "source") return "source";
+    if (l === "ads") return "ads";
+    if (l === "viewer") return "viewer";
+    return "stitcher"; // stitcher, vast, hls
+  }
+
+  function kindOf(msg) {
+    if (msg.includes(">>> SPLICE OUT")) return "splice-out";
+    if (msg.includes("<<< SPLICE IN")) return "splice-in";
+    if (/SCTE-35|^cue /.test(msg)) return "scte";
+    if (/VAST|BEACON|^tracking |mezzanine|conformed|creative /.test(msg)) return "vast";
+    if (/^\s*(ad|slate) \d+\/\d+:/.test(msg) || /pod ready|armed/.test(msg)) return "ad";
+    return "";
+  }
+
+  const fmtTime = (t) => new Date(t * 1000).toTimeString().slice(0, 8);
+
+  function visible(row) {
+    return enabled.has(row.dataset.group) && (!query || row.dataset.text.includes(query));
+  }
+
+  function addRow(ev) {
+    const row = document.createElement("div");
+    const group = groupOf(ev);
+    row.className = `row ${kindOf(ev.msg)} ${ev.level || ""}`;
+    row.dataset.group = group;
+    row.dataset.text = `${ev.logger} ${ev.msg}`.toLowerCase();
+    const time = document.createElement("span"); time.className = "time"; time.textContent = fmtTime(ev.t);
+    const src = document.createElement("span"); src.className = "src"; src.textContent = ev.logger;
+    const msg = document.createElement("span"); msg.className = "msg"; msg.textContent = ev.msg.trim();
+    row.append(time, src, msg);
+    row.hidden = !visible(row);
+    logEl.append(row);
+    while (logEl.childElementCount > MAX_ROWS) logEl.firstElementChild.remove();
+    if (follow) logEl.scrollTop = logEl.scrollHeight;
+    else if (!row.hidden) $("jump").classList.add("show");
+  }
+
+  function refilter() {
+    for (const row of logEl.children) row.hidden = !visible(row);
+    if (follow) logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  logEl.addEventListener("scroll", () => {
+    follow = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 24;
+    if (follow) $("jump").classList.remove("show");
+  });
+  $("jump").addEventListener("click", () => { follow = true; logEl.scrollTop = logEl.scrollHeight; $("jump").classList.remove("show"); });
+  $("filters").addEventListener("click", (e) => {
+    const chip = e.target.closest(".chip");
+    if (!chip) return;
+    const on = chip.getAttribute("aria-pressed") !== "true";
+    chip.setAttribute("aria-pressed", String(on));
+    on ? enabled.add(chip.dataset.group) : enabled.delete(chip.dataset.group);
+    refilter();
+  });
+  $("search").addEventListener("input", (e) => { query = e.target.value.trim().toLowerCase(); refilter(); });
+  $("clear").addEventListener("click", () => { logEl.replaceChildren(); $("jump").classList.remove("show"); });
+
+  // --------------------------------------------------------------- status
+  const st = { inAd: false, breakId: null, item: "", started: 0, duration: 0, nextAt: 0, breaks: 0, durations: {} };
+
+  function track(ev) {
+    const m = ev.msg;
+    let r;
+    if ((r = m.match(/break (\d+) splice-out pts=\d+ \(in ([\d.-]+)s\) duration=([\d.]+)s/))) {
+      st.durations[r[1]] = Number(r[3]);
+      st.nextAt = ev.t + Number(r[2]);
+    } else if ((r = m.match(/>>> SPLICE OUT break (\d+)/))) {
+      Object.assign(st, { inAd: true, breakId: r[1], item: "", started: ev.t, duration: st.durations[r[1]] || 0, nextAt: 0 });
+    } else if ((r = m.match(/^\s*(ad|slate) (\d+)\/(\d+): (.*?) at pts=/))) {
+      st.item = r[1] === "slate" ? `slate ${r[2]}/${r[3]}` : `ad ${r[2]}/${r[3]} · ${r[4]}`;
+    } else if (/<<< SPLICE IN/.test(m)) {
+      Object.assign(st, { inAd: false, breakId: null, item: "" });
+      st.breaks += 1;
+    }
+    renderStatus();
+    trackSplice(m);
+  }
+
+  function renderStatus() {
+    $("stage").classList.toggle("in-ad", st.inAd);
+    $("state").textContent = st.inAd ? `AD BREAK ${st.breakId}` : "PROGRAM";
+    $("detail").textContent = st.inAd ? (st.item || "starting…") : "Network content";
+    $("s-breaks").textContent = String(st.breaks);
+  }
+
+  function tick() {
+    const now = Date.now() / 1000 - delayMs / 1000;
+    if (st.inAd && st.duration) {
+      const pct = Math.min(100, ((now - st.started) / st.duration) * 100);
+      $("progress").style.width = pct.toFixed(1) + "%";
+    }
+    $("s-next").textContent = st.inAd ? "in break" : st.nextAt > now ? `${(st.nextAt - now).toFixed(0)} s` : "–";
+  }
+  setInterval(tick, 250);
+
+  // Events are shown (and drive the status badge) after the chosen delay, so
+  // the log can be lined up with the player's latency.
+  function deliver(ev, immediate) {
+    const run = () => { addRow(ev); track(ev); };
+    if (immediate || delayMs <= 0) run(); else setTimeout(run, delayMs);
+  }
+
+  $("delay").value = String(delayMs / 1000);
+  $("delay-v").textContent = (delayMs / 1000).toFixed(1) + " s";
+  $("delay").addEventListener("input", (e) => {
+    delayMs = Number(e.target.value) * 1000;
+    $("delay-v").textContent = Number(e.target.value).toFixed(1) + " s";
+    localStorageSet("delay", e.target.value);
+  });
+
+  // ------------------------------------------------------------ session
+  // When sign-in is on, the viewer reports who is signed in and when the
+  // session ends; at that point the server closes the streams and the page
+  // signs out (ending the Cognito login too) so the next visit asks again.
+  let sessionEnds = null;
+  let ended = false;
+
+  function endSession() {
+    if (ended) return;
+    ended = true;
+    if (player) { try { player.destroy(); } catch { /* gone */ } player = null; }
+    if (typeof stopPip === "function") stopPip();
+    $("overlay").hidden = false;
+    $("overlay").textContent = "Your 30-minute session has ended. Signing you out…";
+    setTimeout(() => { location.href = "/_auth/logout?reason=expired"; }, 2500);
+  }
+
+  fetch("/api/session", { credentials: "same-origin" })
+    .then((r) => {
+      if (r.status === 401) { location.href = "/_auth/login"; return null; }
+      return r.ok ? r.json() : null;
+    })
+    .then((s) => {
+      if (!s || !s.auth) return;
+      $("session").hidden = false;
+      $("who").textContent = s.email || "signed in";
+      sessionEnds = s.expires;
+    })
+    .catch(() => {});
+
+  setInterval(() => {
+    if (sessionEnds == null) return;
+    const left = sessionEnds - Date.now() / 1000;
+    if (left <= 0) { $("session-left").textContent = "0:00"; endSession(); return; }
+    const m = Math.floor(left / 60), sec = Math.floor(left % 60);
+    $("session-left").textContent = `${m}:${String(sec).padStart(2, "0")}`;
+  }, 1000);
+
+  function connectEvents() {
+    const es = new EventSource("/events");
+    es.addEventListener("expired", () => { es.close(); endSession(); });
+    es.addEventListener("backlog", (e) => {
+      logEl.replaceChildren();
+      for (const ev of JSON.parse(e.data)) deliver(ev, true);
+    });
+    es.onmessage = (e) => deliver(JSON.parse(e.data), false);
+    es.onopen = () => $("dot-events").classList.add("ok");
+    es.onerror = () => $("dot-events").classList.remove("ok"); // EventSource reconnects by itself
+  }
+  connectEvents();
+
+  // ------------------------------------------------------- splice timing
+  // Expected = the SCTE-35 cue (splice-out pts, + break_duration for the
+  // splice-in, or an explicit cue-in). Actual = the stitcher's SPLICE OUT/IN.
+  const HZ = 90000;
+  const SVG = "http://www.w3.org/2000/svg";
+  const splices = new Map();
+  let renderQueued = false;
+
+  function splice(id) {
+    if (!splices.has(id)) splices.set(id, { id: Number(id), status: "" });
+    return splices.get(id);
+  }
+
+  function trackSplice(m) {
+    let r;
+    if ((r = m.match(/SCTE-35 \S+: break (\d+) splice-out pts=(\d+) \(in [-\d.]+s\) duration=([\d.]+)s/))) {
+      const b = splice(r[1]);
+      b.expOut = Number(r[2]);
+      b.expIn = b.expOut + Math.round(Number(r[3]) * HZ);
+    } else if ((r = m.match(/SCTE-35 \S+: break (\d+) splice-out pts=(\d+)/))) {
+      splice(r[1]).expOut = Number(r[2]);
+    } else if ((r = m.match(/break (\d+) returns to network at pts=(\d+)/))) {
+      splice(r[1]).expIn = Number(r[2]);
+    } else if ((r = m.match(/>>> SPLICE OUT break (\d+) at pts=(\d+)/))) {
+      splice(r[1]).actOut = Number(r[2]);
+    } else if ((r = m.match(/<<< SPLICE IN\s+break (\d+) at pts=(\d+)/))) {
+      splice(r[1]).actIn = Number(r[2]);
+    } else if ((r = m.match(/break (\d+): (ads not ready|missed entirely|overlaps)/))) {
+      splice(r[1]).status = "not stitched";
+    } else {
+      return;
+    }
+    if (!renderQueued) { renderQueued = true; requestAnimationFrame(() => { renderQueued = false; renderSplices(); }); }
+  }
+
+  const secs = (pts) => pts / HZ;
+  function clock(s) {
+    const m = Math.floor(s / 60), r = s - m * 60;
+    return `${m}:${r.toFixed(r % 1 ? 2 : 0).padStart(r % 1 ? 5 : 2, "0")}`;
+  }
+  function devText(ticks) {
+    if (ticks == null) return "–";
+    const ms = ticks / 90;
+    return `${ms > 0 ? "+" : ms < 0 ? "−" : "±"}${Math.abs(ms).toFixed(1)} ms`;
+  }
+  function niceStep(span, target) {
+    const raw = span / target, p = 10 ** Math.floor(Math.log10(raw)), f = raw / p;
+    return (f >= 5 ? 10 : f >= 2 ? 5 : f >= 1 ? 2 : 1) * p;
+  }
+  function node(tag, attrs, parent, text) {
+    const n = document.createElementNS(SVG, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    if (parent) parent.append(n);
+    return n;
+  }
+
+  // One tooltip for both charts; rows are [colorVar, value, label].
+  const tip = $("tip");
+  function showTip(evt, title, rows) {
+    tip.replaceChildren();
+    const h = document.createElement("div"); h.className = "h"; h.textContent = title; tip.append(h);
+    for (const [color, value, label] of rows) {
+      const r = document.createElement("div"); r.className = "r";
+      const k = document.createElement("span"); k.className = "lk"; k.style.background = color || "transparent";
+      const v = document.createElement("b"); v.textContent = value;
+      const l = document.createElement("span"); l.textContent = label;
+      r.append(k, v, l); tip.append(r);
+    }
+    tip.style.display = "block";
+    const box = evt.target.getBoundingClientRect();
+    const x = evt.clientX ?? box.left + box.width / 2, y = evt.clientY ?? box.top;
+    const w = tip.offsetWidth, hgt = tip.offsetHeight;
+    tip.style.left = Math.min(window.innerWidth - w - 8, Math.max(8, x + 14)) + "px";
+    tip.style.top = Math.max(8, y - hgt - 12) + "px";
+  }
+  const hideTip = () => { tip.style.display = "none"; };
+  function hoverable(el, title, rows) {
+    el.setAttribute("tabindex", "0");
+    el.setAttribute("aria-label", `${title}: ` + rows().map((r) => `${r[2]} ${r[1]}`).join(", "));
+    el.addEventListener("pointermove", (e) => showTip(e, title, rows()));
+    el.addEventListener("focus", (e) => showTip(e, title, rows()));
+    el.addEventListener("pointerleave", hideTip);
+    el.addEventListener("blur", hideTip);
+  }
+  function breakRows(b) {
+    return [
+      ["var(--series-1)", b.expOut != null ? clock(secs(b.expOut)) : "–", "expected out"],
+      ["var(--series-2)", b.actOut != null ? clock(secs(b.actOut)) : b.status || "–", "actual out"],
+      ["var(--series-3)", devText(b.actOut != null && b.expOut != null ? b.actOut - b.expOut : null), "Δ out"],
+      ["var(--series-1)", b.expIn != null ? clock(secs(b.expIn)) : "–", "expected in"],
+      ["var(--series-2)", b.actIn != null ? clock(secs(b.actIn)) : b.actOut != null ? "in break" : "–", "actual in"],
+      ["var(--series-4)", devText(b.actIn != null && b.expIn != null ? b.actIn - b.expIn : null), "Δ in"],
+    ];
+  }
+
+  function renderSplices() {
+    const list = [...splices.values()].filter((b) => b.expOut != null || b.actOut != null).sort((a, b) => a.id - b.id);
+    renderTimeline(list.slice(-6));
+    renderAccuracy(list.filter((b) => b.actOut != null).slice(-8));
+    renderTable(list);
+  }
+
+  function renderTimeline(list) {
+    const host = $("tl");
+    host.replaceChildren();
+    if (!list.length) {
+      const e = document.createElement("div"); e.className = "empty"; e.textContent = "Waiting for the first SCTE-35 cue…";
+      host.append(e); return;
+    }
+    const W = Math.max(280, host.clientWidth), H = 116;
+    const m = { l: 74, r: 12, t: 16, b: 22 };
+    const rows = [{ label: "Expected", y: m.t + 6 }, { label: "Actual", y: m.t + 36 }];
+    const bar = 14;
+    let lo = Infinity, hi = -Infinity;
+    for (const b of list) {
+      for (const v of [b.expOut, b.actOut]) if (v != null) lo = Math.min(lo, secs(v));
+      for (const v of [b.expIn, b.actIn, b.expOut, b.actOut]) if (v != null) hi = Math.max(hi, secs(v));
+    }
+    const pad = Math.max(2, (hi - lo) * 0.04);
+    lo -= pad; hi += pad;
+    const x = (s) => m.l + ((s - lo) / (hi - lo)) * (W - m.l - m.r);
+    const svg = node("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "Expected versus actual break timeline" }, host);
+
+    const step = niceStep(hi - lo, Math.max(3, Math.floor(W / 110)));
+    for (let s = Math.ceil(lo / step) * step; s <= hi; s += step) {
+      node("line", { x1: x(s), x2: x(s), y1: m.t - 4, y2: H - m.b, stroke: "var(--grid)", "stroke-width": 1 }, svg);
+      node("text", { x: x(s), y: H - 6, "text-anchor": "middle" }, svg, clock(s));
+    }
+    node("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: "var(--axis)", "stroke-width": 1 }, svg);
+    for (const r of rows) node("text", { x: 0, y: r.y + bar / 2 + 4, class: "row-label" }, svg, r.label);
+
+    for (const b of list) {
+      const g = node("g", {}, svg);
+      if (b.expOut != null) {
+        const x0 = x(secs(b.expOut)), x1 = b.expIn != null ? x(secs(b.expIn)) : x0 + 4;
+        node("rect", { x: x0, y: rows[0].y, width: Math.max(3, x1 - x0), height: bar, rx: 3, fill: "var(--series-1)" }, g);
+        if (x1 - x0 > 40) node("text", { x: x0, y: rows[0].y - 4 }, g, `#${b.id}`);
+      }
+      if (b.actOut != null) {
+        const done = b.actIn != null;
+        const end = done ? b.actIn : b.expIn ?? b.actOut;
+        const x0 = x(secs(b.actOut)), x1 = x(secs(end));
+        node("rect", { x: x0, y: rows[1].y, width: Math.max(3, x1 - x0), height: bar, rx: 3,
+                       fill: "var(--series-2)", opacity: done ? 1 : 0.35 }, g);
+      } else if (b.status) {
+        node("text", { x: x(secs(b.expOut)), y: rows[1].y + bar / 2 + 4 }, g, b.status);
+      }
+      const xs = [b.expOut, b.expIn, b.actOut, b.actIn].filter((v) => v != null).map((v) => x(secs(v)));
+      const hit = node("rect", { x: Math.min(...xs) - 6, y: m.t - 6, width: Math.max(...xs) - Math.min(...xs) + 12,
+                                 height: rows[1].y + bar + 6 - (m.t - 6), class: "hit" }, g);
+      hoverable(hit, `Break ${b.id}`, () => breakRows(b));
+    }
+  }
+
+  function renderAccuracy(list) {
+    const host = $("acc");
+    host.replaceChildren();
+    if (!list.length) {
+      const e = document.createElement("div"); e.className = "empty"; e.textContent = "No breaks stitched yet.";
+      host.append(e); return;
+    }
+    const W = Math.max(240, host.clientWidth), H = 116;
+    const m = { l: 52, r: 8, t: 8, b: 22 };
+    const devs = list.flatMap((b) => [b.actOut - b.expOut, b.actIn != null && b.expIn != null ? b.actIn - b.expIn : null])
+      .filter((v) => v != null && !Number.isNaN(v)).map((t) => Math.abs(t / 90));
+    const step = niceStep(Math.max(40, ...devs.map((d) => d * 1.15)), 2);
+    const top = Math.max(step, Math.ceil(Math.max(0, ...devs) * 1.15 / step) * step);
+    const y = (ms) => m.t + ((top - ms) / (2 * top)) * (H - m.t - m.b);
+    const svg = node("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img", "aria-label": "Splice accuracy per break in milliseconds" }, host);
+
+    for (let v = -top; v <= top + 1e-9; v += step) {
+      node("line", { x1: m.l, x2: W - m.r, y1: y(v), y2: y(v), stroke: v === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }, svg);
+      node("text", { x: m.l - 6, y: y(v) + 4, "text-anchor": "end" }, svg, `${v > 0 ? "+" : v < 0 ? "−" : ""}${Math.abs(v)}`);
+    }
+    const band = (W - m.l - m.r) / list.length;
+    list.forEach((b, i) => {
+      const cx = m.l + band * (i + 0.5);
+      const g = node("g", {}, svg);
+      node("text", { x: cx, y: H - 6, "text-anchor": "middle" }, g, `#${b.id}`);
+      if (b.expOut != null) {
+        node("circle", { cx: cx - 7, cy: y((b.actOut - b.expOut) / 90), r: 5, fill: "var(--series-3)", stroke: "var(--panel)", "stroke-width": 2 }, g);
+      }
+      if (b.actIn != null && b.expIn != null) {
+        const cy = y((b.actIn - b.expIn) / 90), cx2 = cx + 7, s = 6;
+        node("path", { d: `M${cx2} ${cy - s} ${cx2 + s} ${cy} ${cx2} ${cy + s} ${cx2 - s} ${cy}Z`, fill: "var(--series-4)", stroke: "var(--panel)", "stroke-width": 2 }, g);
+      }
+      const hit = node("rect", { x: m.l + band * i, y: m.t, width: band, height: H - m.t - m.b, class: "hit" }, g);
+      hoverable(hit, `Break ${b.id}`, () => breakRows(b));
+    });
+  }
+
+  function renderTable(list) {
+    const body = $("splice-rows");
+    body.replaceChildren();
+    for (const b of list.slice().reverse()) {
+      const tr = document.createElement("tr");
+      const cells = [
+        `#${b.id}`,
+        b.expOut != null ? `${b.expOut} (${clock(secs(b.expOut))})` : "–",
+        b.actOut != null ? String(b.actOut) : "–",
+        devText(b.actOut != null && b.expOut != null ? b.actOut - b.expOut : null),
+        b.expIn != null ? `${b.expIn} (${clock(secs(b.expIn))})` : "–",
+        b.actIn != null ? String(b.actIn) : "–",
+        devText(b.actIn != null && b.expIn != null ? b.actIn - b.expIn : null),
+        b.status || (b.actIn != null ? "stitched" : b.actOut != null ? "in break" : "upcoming"),
+      ];
+      for (const c of cells) { const td = document.createElement("td"); td.textContent = c; tr.append(td); }
+      body.append(tr);
+    }
+  }
+
+  new ResizeObserver(() => renderSplices()).observe($("tl"));
+  renderSplices();
+
+  // ---------------------------------------------------------------- video
+  const video = $("video");
+  let player = null;
+
+  function startPlayer() {
+    if (!window.mpegts || !mpegts.getFeatureList().mseLivePlayback) {
+      $("overlay").textContent = "This browser cannot play live MPEG-TS (needs Media Source Extensions).";
+      return;
+    }
+    // Absolute URL: mpegts.js fetches from a Web Worker, where "/live.ts" would not resolve.
+    player = mpegts.createPlayer(
+      { type: "mpegts", isLive: true, url: new URL("/live.ts", location.href).href },
+      { enableWorker: true, enableStashBuffer: false, lazyLoad: false,
+        liveBufferLatencyChasing: true, liveBufferLatencyMaxLatency: 1.5, liveBufferLatencyMinRemain: 0.3 },
+    );
+    player.attachMediaElement(video);
+    player.on(mpegts.Events.ERROR, (type, detail, info) => {
+      const why = [type, detail, info && (info.msg || info.code)].filter(Boolean).join(" · ");
+      console.warn("player error:", type, detail, info);
+      restartPlayer(why);
+    });
+    player.on(mpegts.Events.LOADING_COMPLETE, () => restartPlayer("stream ended"));
+    player.on(mpegts.Events.STATISTICS_INFO, (s) => {
+      if (s.speed) $("s-rate").textContent = (s.speed * 8 / 1000).toFixed(2) + " Mb/s";
+    });
+    player.load();
+    video.play().catch(() => {});
+  }
+
+  function restartPlayer(why) {
+    if (ended) return;
+    $("dot-video").classList.remove("ok");
+    $("overlay").textContent = `Stream interrupted${why ? ` (${why})` : ""}, reconnecting…`;
+    $("overlay").hidden = false;
+    if (player) { try { player.destroy(); } catch { /* already gone */ } player = null; }
+    setTimeout(startPlayer, 2000);
+  }
+
+  video.addEventListener("playing", () => { $("overlay").hidden = true; $("dot-video").classList.add("ok"); });
+  $("unmute").addEventListener("click", () => {
+    video.muted = !video.muted;
+    $("unmute").textContent = video.muted ? "🔇 Unmute" : "🔊 Mute";
+    video.play().catch(() => {});
+  });
+
+  setInterval(() => {
+    if (video.buffered.length) {
+      const ahead = video.buffered.end(video.buffered.length - 1) - video.currentTime;
+      $("s-buffer").textContent = ahead.toFixed(2) + " s";
+    }
+    if (video.videoWidth) $("s-res").textContent = `${video.videoWidth}×${video.videoHeight}`;
+    const q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+    if (q) $("s-drop").textContent = `${q.droppedVideoFrames} / ${q.totalVideoFrames}`;
+  }, 1000);
+
+  startPlayer();
+
+  // ------------------------------------------------- incoming preview (PiP)
+  // A small, low-bitrate re-encode of the stitcher's incoming feed (/preview.ts),
+  // so program and ads can be compared against the stitched output.
+  const pipVideo = $("pip-video");
+  let pipPlayer = null;
+  let pipWanted = localStorageGet("pip") !== "off";
+  let pipAvailable = true;
+
+  function showPip(on) {
+    pipWanted = on;
+    localStorageSet("pip", on ? "on" : "off");
+    $("pip").hidden = !(on && pipAvailable);
+    $("pip-show").hidden = on || !pipAvailable;
+    if (on && pipAvailable && !ended) startPip(); else stopPip();
+  }
+
+  function stopPip() {
+    if (pipPlayer) { try { pipPlayer.destroy(); } catch { /* gone */ } pipPlayer = null; }
+  }
+
+  function startPip() {
+    if (pipPlayer || !window.mpegts || !mpegts.getFeatureList().mseLivePlayback) return;
+    pipPlayer = mpegts.createPlayer(
+      { type: "mpegts", isLive: true, hasAudio: false, url: new URL("/preview.ts", location.href).href },
+      { enableWorker: true, enableStashBuffer: false, lazyLoad: false,
+        liveBufferLatencyChasing: true, liveBufferLatencyMaxLatency: 1.5, liveBufferLatencyMinRemain: 0.3 },
+    );
+    pipPlayer.attachMediaElement(pipVideo);
+    pipPlayer.on(mpegts.Events.ERROR, () => {
+      stopPip();
+      $("pip-msg").hidden = false;
+      $("pip-msg").textContent = "Reconnecting…";
+      if (pipWanted && !ended) setTimeout(startPip, 3000);
+    });
+    pipPlayer.load();
+    pipVideo.play().catch(() => {});
+  }
+
+  pipVideo.addEventListener("playing", () => { $("pip-msg").hidden = true; });
+
+  // ---------------------------------------------------------- A/V sync
+  // The server sends program and incoming preview in step (same content time
+  // together). Keeping both players at the same small buffer then shows the
+  // same frame in both windows: nudge playbackRate (±5%, inaudible) toward the
+  // target, and jump only if a player has fallen far behind.
+  const SYNC_TARGET = 1.0;   // seconds of buffered video each player keeps (absorbs delivery hiccups)
+  function bufferAhead(v) {
+    return v.buffered.length ? v.buffered.end(v.buffered.length - 1) - v.currentTime : null;
+  }
+  setInterval(() => {
+    for (const v of [video, pipVideo]) {
+      const ahead = bufferAhead(v);
+      if (ahead === null || v.paused || v.readyState < 3) continue;
+      if (ahead > SYNC_TARGET + 1.0) {
+        v.currentTime = v.buffered.end(v.buffered.length - 1) - SYNC_TARGET;
+        v.playbackRate = 1;
+        continue;
+      }
+      v.playbackRate = Math.min(1.05, Math.max(0.95, 1 + (ahead - SYNC_TARGET) * 0.25));
+    }
+  }, 250);
+  $("pip-hide").addEventListener("click", () => showPip(false));
+  $("pip-show").addEventListener("click", () => showPip(true));
+
+  // The preview only exists when the deployment enables it; hide the window if not.
+  fetch("/api/session", { credentials: "same-origin" })
+    .then((r) => (r.ok ? r.json() : null))
+    .then((info) => { pipAvailable = Boolean(info && info.preview); showPip(pipWanted); })
+    .catch(() => { pipAvailable = false; showPip(false); });
+})();
+</script>
+</body>
+</html>

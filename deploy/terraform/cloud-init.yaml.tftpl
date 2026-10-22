@@ -1,0 +1,42 @@
+#cloud-config
+# First boot: install Docker, the AWS CLI and the SRT VAST boot/idle units.
+# Every boot after that: srt-vast.service refreshes config + code and starts the stack.
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - unzip
+  - curl
+  - python3
+  - certbot
+  - python3-certbot-dns-route53
+
+write_files:
+  - path: /etc/srt-vast.conf
+    permissions: "0644"
+    content: |
+      ${indent(6, conf)}
+  - path: /usr/local/bin/srt-vast-boot
+    permissions: "0755"
+    encoding: b64
+    content: ${boot_sh}
+  - path: /usr/local/bin/srt-vast-idle
+    permissions: "0755"
+    encoding: b64
+    content: ${idle_sh}
+  - path: /etc/systemd/system/srt-vast.service
+    encoding: b64
+    content: ${boot_unit}
+  - path: /etc/systemd/system/srt-vast-idle.service
+    encoding: b64
+    content: ${idle_unit}
+  - path: /etc/systemd/system/srt-vast-idle.timer
+    encoding: b64
+    content: ${idle_timer}
+
+runcmd:
+  - snap install aws-cli --classic
+  - systemctl daemon-reload
+  - systemctl enable --now docker
+  - systemctl enable --now srt-vast.service
+  - systemctl enable --now srt-vast-idle.timer

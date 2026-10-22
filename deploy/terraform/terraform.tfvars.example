@@ -1,0 +1,22 @@
+# Copy to terraform.tfvars (git-ignored) and fill in.
+
+domain   = "example.com"     # existing Route 53 zone; only records under `hostname` are created
+hostname = "srt.example.com"
+
+allowed_emails = [
+  "you@example.com",
+  "colleague@example.com",
+]
+
+# From `terraform output` in deploy/bootstrap:
+permissions_boundary_arn = "arn:aws:iam::123456789012:policy/srt-vast-boundary"
+user_pool_id             = "us-west-2_AbCdEfGhI"
+vpc_id                   = "vpc-0123456789abcdef0"
+subnet_id                = "subnet-0123456789abcdef0"
+
+# Defaults, shown for reference:
+# aws_region       = "us-west-2"
+# instance_type    = "c7g.large"
+# session_minutes  = 30
+# idle_minutes     = 5
+# max_uptime_hours = 12

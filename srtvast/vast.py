@@ -39,6 +39,7 @@ class Ad:
     impressions: list[str] = field(default_factory=list)
     tracking: dict[str, list[str]] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    mezzanine: list[MediaFile] = field(default_factory=list)  # VAST 4 <Mezzanine>: master for SSAI conform
 
     def pick_media(self, preference=(HLS_MIME_TYPES, TS_MIME_TYPES),
                    extensions=(".m3u8", ".ts")) -> MediaFile | None:
@@ -136,12 +137,18 @@ def parse_vast(xml: bytes | str) -> list[Ad | Wrapper]:
                           _int(m.get("width")), _int(m.get("height")), _int(m.get("bitrate")))
                 for m in _descendants(inline, "MediaFile") if _text(m)
             ]
+            mezzanine = [
+                MediaFile(_text(m), m.get("type", ""), m.get("delivery", ""),
+                          _int(m.get("width")), _int(m.get("height")))
+                for m in _descendants(inline, "Mezzanine") if _text(m)
+            ]
             items.append(Ad(
                 ad_id=ad_el.get("id", ""),
                 sequence=sequence,
                 title=_text(_child(inline, "AdTitle")),
                 duration=parse_duration(_text(_child(linear, "Duration"))) if linear is not None else None,
                 media_files=media,
+                mezzanine=mezzanine,
                 impressions=impressions,
                 tracking=tracking,
                 errors=errors,
