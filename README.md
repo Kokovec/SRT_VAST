@@ -211,3 +211,7 @@ length_k)*, clipped to *S_in*; slate clips fill whatever the pod leaves.
   `srt-live-transmit` produces. A broadcast handoff (ASI/SMPTE 2022) would need a
   CBR re-mux with null-packet stuffing.
 - No encrypted SCTE-35, no component-level splicing, single program only.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
