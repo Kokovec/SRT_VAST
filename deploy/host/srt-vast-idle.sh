@@ -4,7 +4,7 @@
 #   * nobody has had the viewer open for IDLE_MINUTES, or
 #   * the viewer has not come up within BOOT_GRACE_MINUTES of boot (broken stack), or
 #   * the instance has been up for MAX_UPTIME_HOURS (cost backstop).
-# The Cloudflare Worker starts it again on the next sign-in.
+# The starter Lambda (CloudFront failover) starts it again on the next sign-in.
 set -euo pipefail
 source /etc/srt-vast.conf
 IDLE_MINUTES=${IDLE_MINUTES:-5}

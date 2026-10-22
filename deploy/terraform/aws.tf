@@ -1,31 +1,26 @@
-# EC2 host for the docker compose stack. No inbound access at all: the
-# Cloudflare tunnel dials out, admin access is SSM Session Manager.
+# EC2 host for the docker compose stack. Inbound: HTTPS from CloudFront's
+# origin-facing ranges only. Admin access: SSM Session Manager.
 
 data "aws_ssm_parameter" "ubuntu_arm64" {
   name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
 }
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
-  }
-  filter {
-    name   = "default-for-az"
-    values = ["true"]
-  }
-}
-
 data "aws_caller_identity" "me" {}
+
+data "aws_route53_zone" "main" {
+  name         = var.domain
+  private_zone = false
+}
+
+data "aws_ec2_managed_prefix_list" "cloudfront" {
+  name = "com.amazonaws.global.cloudfront.origin-facing"
+}
 
 locals {
   param_prefix = "/${var.name}"
   bundle_key   = "bundle/${var.name}.zip"
   repo_root    = abspath("${path.module}/../..")
+  origin_host  = "origin.${var.hostname}" # A record the host points at itself on every boot
 }
 
 # ---------------------------------------------------------------- code bundle
@@ -38,7 +33,9 @@ data "archive_file" "bundle" {
     ".git", ".git/**", "out", "out/**", ".claude", ".claude/**",
     "deploy/terraform/.terraform", "deploy/terraform/.terraform/**", "deploy/terraform/.build",
     "deploy/terraform/.build/**", "deploy/terraform/terraform.tfstate", "deploy/terraform/terraform.tfstate.backup",
-    "deploy/terraform/terraform.tfvars", "**/__pycache__/**",
+    "deploy/terraform/terraform.tfvars", "deploy/bootstrap/.terraform", "deploy/bootstrap/.terraform/**",
+    "deploy/bootstrap/terraform.tfstate", "deploy/bootstrap/terraform.tfstate.backup",
+    "deploy/bootstrap/terraform.tfvars", "**/__pycache__/**",
   ]
 }
 
@@ -62,27 +59,20 @@ resource "aws_s3_object" "bundle" {
   etag   = data.archive_file.bundle.output_md5
 }
 
-# ---------------------------------------------------------------- settings / secrets
+# ---------------------------------------------------------------- settings (-> /opt/srt-vast/.env)
 
-resource "aws_ssm_parameter" "tunnel_token" {
-  name  = "${local.param_prefix}/TUNNEL_TOKEN"
-  type  = "SecureString"
-  value = cloudflare_zero_trust_tunnel_cloudflared.viewer.tunnel_token
-}
-
-resource "aws_ssm_parameter" "access_team" {
-  name  = "${local.param_prefix}/CF_ACCESS_TEAM_DOMAIN"
+resource "aws_ssm_parameter" "settings" {
+  for_each = {
+    AUTH_ISSUER     = local.issuer
+    AUTH_AUDIENCE   = aws_cognito_user_pool_client.viewer.id
+    ORIGIN_HOSTNAME = local.origin_host
+  }
+  name  = "${local.param_prefix}/${each.key}"
   type  = "String"
-  value = var.access_team_domain
+  value = each.value
 }
 
-resource "aws_ssm_parameter" "access_aud" {
-  name  = "${local.param_prefix}/CF_ACCESS_AUD"
-  type  = "String"
-  value = cloudflare_zero_trust_access_application.viewer.aud
-}
-
-# ---------------------------------------------------------------- instance role
+# ---------------------------------------------------------------- host role
 
 data "aws_iam_policy_document" "ec2_assume" {
   statement {
@@ -95,7 +85,7 @@ data "aws_iam_policy_document" "ec2_assume" {
 }
 
 resource "aws_iam_role" "host" {
-  name_prefix          = "${var.name}-host-"
+  name_prefix          = "${var.name}-svc-host-"
   assume_role_policy   = data.aws_iam_policy_document.ec2_assume.json
   permissions_boundary = var.permissions_boundary_arn
 }
@@ -116,6 +106,26 @@ data "aws_iam_policy_document" "host" {
     actions   = ["ssm:GetParametersByPath"]
     resources = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.me.account_id}:parameter${local.param_prefix}"]
   }
+  statement {
+    sid       = "OriginRecordAndCertChallenge" # its own A record + the Let's Encrypt TXT record, nothing else
+    actions   = ["route53:ChangeResourceRecordSets"]
+    resources = [data.aws_route53_zone.main.arn]
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "route53:ChangeResourceRecordSetsNormalizedRecordNames"
+      values   = [local.origin_host, "_acme-challenge.${local.origin_host}"]
+    }
+    condition {
+      test     = "Null"
+      variable = "route53:ChangeResourceRecordSetsNormalizedRecordNames"
+      values   = ["false"]
+    }
+  }
+  statement {
+    sid       = "Route53Lookups"
+    actions   = ["route53:ListHostedZones", "route53:GetChange"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "host" {
@@ -132,8 +142,16 @@ resource "aws_iam_instance_profile" "host" {
 
 resource "aws_security_group" "host" {
   name_prefix = "${var.name}-"
-  description = "No inbound; outbound for the tunnel, package installs, S3/SSM"
-  vpc_id      = data.aws_vpc.default.id
+  description = "HTTPS from CloudFront only; outbound for packages, S3, SSM, Route 53, Lets Encrypt"
+  vpc_id      = var.vpc_id
+
+  ingress {
+    description     = "CloudFront origin-facing"
+    from_port       = 443
+    to_port         = 443
+    protocol        = "tcp"
+    prefix_list_ids = [data.aws_ec2_managed_prefix_list.cloudfront.id]
+  }
 
   egress {
     from_port        = 0
@@ -147,10 +165,10 @@ resource "aws_security_group" "host" {
 resource "aws_instance" "host" {
   ami                         = data.aws_ssm_parameter.ubuntu_arm64.value
   instance_type               = var.instance_type
-  subnet_id                   = data.aws_subnets.default.ids[0]
+  subnet_id                   = var.subnet_id
   vpc_security_group_ids      = [aws_security_group.host.id]
   iam_instance_profile        = aws_iam_instance_profile.host.name
-  associate_public_ip_address = true # outbound only (no inbound rules); avoids paying for a NAT gateway
+  associate_public_ip_address = true # changes per start; the boot script updates origin.<hostname>
 
   # The idle watchdog powers the OS off; that must STOP the instance, not terminate it.
   instance_initiated_shutdown_behavior = "stop"
@@ -172,14 +190,16 @@ resource "aws_instance" "host" {
       "BUCKET=${aws_s3_bucket.bundle.id}",
       "KEY=${local.bundle_key}",
       "PARAM_PREFIX=${local.param_prefix}",
+      "ZONE_ID=${data.aws_route53_zone.main.zone_id}",
+      "ORIGIN_HOSTNAME=${local.origin_host}",
       "IDLE_MINUTES=${var.idle_minutes}",
       "MAX_UPTIME_HOURS=${var.max_uptime_hours}",
     ])
-    boot_sh      = filebase64("${path.module}/../host/srt-vast-boot.sh")
-    idle_sh      = filebase64("${path.module}/../host/srt-vast-idle.sh")
-    boot_unit    = filebase64("${path.module}/../host/srt-vast.service")
-    idle_unit    = filebase64("${path.module}/../host/srt-vast-idle.service")
-    idle_timer   = filebase64("${path.module}/../host/srt-vast-idle.timer")
+    boot_sh    = filebase64("${path.module}/../host/srt-vast-boot.sh")
+    idle_sh    = filebase64("${path.module}/../host/srt-vast-idle.sh")
+    boot_unit  = filebase64("${path.module}/../host/srt-vast.service")
+    idle_unit  = filebase64("${path.module}/../host/srt-vast-idle.service")
+    idle_timer = filebase64("${path.module}/../host/srt-vast-idle.timer")
   })
 
   tags = { Name = var.name }
@@ -190,36 +210,5 @@ resource "aws_instance" "host" {
     ignore_changes = [ami, user_data]
   }
 
-  depends_on = [aws_s3_object.bundle, aws_ssm_parameter.tunnel_token, aws_ssm_parameter.access_aud]
-}
-
-# ---------------------------------------------------------------- waker credentials
-
-# The Cloudflare Worker uses these to start the instance on sign-in. They can
-# describe instances and start this one instance, nothing else.
-resource "aws_iam_user" "waker" {
-  name                 = "${var.name}-waker"
-  permissions_boundary = var.permissions_boundary_arn
-}
-
-data "aws_iam_policy_document" "waker" {
-  statement {
-    sid       = "StartThisInstance"
-    actions   = ["ec2:StartInstances"]
-    resources = [aws_instance.host.arn]
-  }
-  statement {
-    sid       = "ReadState"
-    actions   = ["ec2:DescribeInstances"]
-    resources = ["*"] # DescribeInstances has no resource-level permissions
-  }
-}
-
-resource "aws_iam_user_policy" "waker" {
-  user   = aws_iam_user.waker.name
-  policy = data.aws_iam_policy_document.waker.json
-}
-
-resource "aws_iam_access_key" "waker" {
-  user = aws_iam_user.waker.name
+  depends_on = [aws_s3_object.bundle, aws_ssm_parameter.settings]
 }

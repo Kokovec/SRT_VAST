@@ -152,7 +152,7 @@
     <div class="session" id="session" hidden>
       <span><b id="who"></b></span>
       <span>session ends in <b id="session-left">–</b></span>
-      <a href="/cdn-cgi/access/logout">Log out</a>
+      <a href="/_auth/logout">Log out</a>
     </div>
   </header>
 
@@ -364,9 +364,9 @@
   });
 
   // ------------------------------------------------------------ session
-  // Behind Cloudflare Access the viewer reports who is signed in and when the
+  // When sign-in is on, the viewer reports who is signed in and when the
   // session ends; at that point the server closes the streams and the page
-  // goes back through sign-in.
+  // signs out (ending the Cognito login too) so the next visit asks again.
   let sessionEnds = null;
   let ended = false;
 
@@ -375,12 +375,15 @@
     ended = true;
     if (player) { try { player.destroy(); } catch { /* gone */ } player = null; }
     $("overlay").hidden = false;
-    $("overlay").textContent = "Your session has ended. Taking you back to sign-in…";
-    setTimeout(() => { location.href = "/"; }, 2500);
+    $("overlay").textContent = "Your 30-minute session has ended. Signing you out…";
+    setTimeout(() => { location.href = "/_auth/logout?reason=expired"; }, 2500);
   }
 
   fetch("/api/session", { credentials: "same-origin" })
-    .then((r) => (r.ok ? r.json() : null))
+    .then((r) => {
+      if (r.status === 401) { location.href = "/_auth/login"; return null; }
+      return r.ok ? r.json() : null;
+    })
     .then((s) => {
       if (!s || !s.auth) return;
       $("session").hidden = false;

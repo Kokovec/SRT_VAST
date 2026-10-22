@@ -12,7 +12,42 @@ variable "aws_region" {
 variable "permissions_boundary_arn" {
   description = "Boundary from deploy/bootstrap; the deploy role can only create identities that carry it."
   type        = string
-  default     = null
+}
+
+variable "vpc_id" {
+  description = "VPC from deploy/bootstrap (`terraform output vpc_id`)."
+  type        = string
+}
+
+variable "subnet_id" {
+  description = "Public subnet from deploy/bootstrap (`terraform output subnet_id`)."
+  type        = string
+}
+
+variable "user_pool_id" {
+  description = "Cognito user pool from deploy/bootstrap (`terraform output user_pool_id`)."
+  type        = string
+}
+
+variable "domain" {
+  description = "Existing Route 53 public hosted zone, e.g. example.com. Only records under `hostname` are touched."
+  type        = string
+}
+
+variable "hostname" {
+  description = "Viewer URL host inside that zone, e.g. srt.example.com."
+  type        = string
+}
+
+variable "allowed_emails" {
+  description = "People allowed in. Each gets an email with a temporary password. Add/remove and re-apply."
+  type        = list(string)
+}
+
+variable "session_minutes" {
+  description = "Session length: the ID token lifetime. Streams are cut and the user signed out when it ends."
+  type        = number
+  default     = 30
 }
 
 variable "instance_type" {
@@ -26,36 +61,6 @@ variable "root_volume_gb" {
   default = 20
 }
 
-variable "cloudflare_account_id" {
-  type = string
-}
-
-variable "cloudflare_zone_id" {
-  description = "Zone (domain) on Cloudflare that hosts the viewer hostname."
-  type        = string
-}
-
-variable "hostname" {
-  description = "Public hostname for the viewer, inside that zone, e.g. srt.example.com."
-  type        = string
-}
-
-variable "access_team_domain" {
-  description = "Cloudflare Zero Trust team domain, e.g. myteam.cloudflareaccess.com."
-  type        = string
-}
-
-variable "allowed_emails" {
-  description = "People allowed in. Add or remove an address and re-apply."
-  type        = list(string)
-}
-
-variable "session_duration" {
-  description = "Cloudflare Access session length; the viewer also ends streams at the token's expiry."
-  type        = string
-  default     = "30m"
-}
-
 variable "idle_minutes" {
   description = "Stop the instance after this long with nobody watching."
   type        = number
@@ -66,10 +71,4 @@ variable "max_uptime_hours" {
   description = "Cost backstop: stop the instance after this long regardless."
   type        = number
   default     = 12
-}
-
-variable "create_otp_login" {
-  description = "Create the Cloudflare one-time PIN (email code) login method. Set false if the team already has it."
-  type        = bool
-  default     = true
 }

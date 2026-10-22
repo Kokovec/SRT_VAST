@@ -1,10 +1,10 @@
-"""Cloudflare Access JWT verification, standard library only.
+"""Session token (JWT) verification, standard library only.
 
-Cloudflare Access signs every request it lets through with an RS256 JWT
-(``Cf-Access-Jwt-Assertion`` header, ``CF_Authorization`` cookie). Verifying
-it here means the viewer trusts only Access, not whatever reaches its port,
-and gives the viewer the user's email and session expiry: streams are closed
-when the session ends.
+Users sign in with Amazon Cognito (hosted login); the starter Lambda puts the
+Cognito ID token in a cookie. The viewer verifies that RS256 token against the
+user pool's published keys on every request, which gives it the user's email
+and the session expiry: streams are closed when the session ends. The same
+module runs inside the starter Lambda.
 """
 
 from __future__ import annotations
@@ -20,11 +20,13 @@ from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from typing import Callable
 
+SESSION_COOKIE = "srtvast_session"
+
 # DER DigestInfo prefix for SHA-256 (RFC 8017 section 9.2, note 1).
 _SHA256_DIGEST_INFO = bytes.fromhex("3031300d060960864801650304020105000420")
 
 
-class AccessError(Exception):
+class AuthError(Exception):
     pass
 
 
@@ -53,31 +55,32 @@ def rsa_verify_sha256(message: bytes, signature: bytes, n: int, e: int) -> bool:
     return hmac.compare_digest(encoded, expected)
 
 
-def token_from_headers(headers) -> str | None:
-    token = headers.get("Cf-Access-Jwt-Assertion")
-    if token:
-        return token.strip()
-    cookie = headers.get("Cookie")
-    if cookie:
-        jar = SimpleCookie()
-        try:
-            jar.load(cookie)
-        except Exception:  # noqa: BLE001 - malformed cookie header
-            return None
-        if "CF_Authorization" in jar:
-            return jar["CF_Authorization"].value
-    return None
+def cookie_value(cookie_header: str | None, name: str = SESSION_COOKIE) -> str | None:
+    if not cookie_header:
+        return None
+    jar = SimpleCookie()
+    try:
+        jar.load(cookie_header)
+    except Exception:  # noqa: BLE001 - malformed cookie header
+        return None
+    return jar[name].value if name in jar else None
 
 
-class AccessVerifier:
-    """Verifies Access JWTs for one application (audience tag) of one team."""
+class JwtVerifier:
+    """Verifies RS256 JWTs from one issuer for one audience.
 
-    def __init__(self, team_domain: str, audience: str, fetch: Callable[[str], bytes] | None = None,
+    For a Cognito user pool: issuer ``https://cognito-idp.<region>.amazonaws.com/<pool id>``,
+    audience = the app client ID, token_use ``id``. Keys come from
+    ``<issuer>/.well-known/jwks.json``.
+    """
+
+    def __init__(self, issuer: str, audience: str, token_use: str | None = "id",
+                 jwks_url: str | None = None, fetch: Callable[[str], bytes] | None = None,
                  leeway: float = 30.0) -> None:
-        domain = team_domain.removeprefix("https://").removeprefix("http://").rstrip("/")
-        self.issuer = f"https://{domain}"
-        self.certs_url = f"{self.issuer}/cdn-cgi/access/certs"
+        self.issuer = issuer.rstrip("/")
         self.audience = audience
+        self.token_use = token_use
+        self.jwks_url = jwks_url or f"{self.issuer}/.well-known/jwks.json"
         self.leeway = leeway
         self._fetch = fetch or (lambda url: urllib.request.urlopen(url, timeout=5).read())
         self._keys: dict[str, tuple[int, int]] = {}
@@ -88,7 +91,7 @@ class AccessVerifier:
         now = time.monotonic()
         if self._keys and now - self._fetched < (30 if force else 3600):
             return  # cached; a forced refresh (unknown kid) at most every 30 s
-        data = json.loads(self._fetch(self.certs_url))
+        data = json.loads(self._fetch(self.jwks_url))
         keys = {}
         for jwk in data.get("keys", []):
             if jwk.get("kty") == "RSA" and "kid" in jwk:
@@ -100,36 +103,38 @@ class AccessVerifier:
         with self._lock:
             self._refresh(force=False)
             if kid not in self._keys:
-                self._refresh(force=True)  # Access rotates its signing keys
+                self._refresh(force=True)  # the issuer rotated its signing keys
             if kid not in self._keys:
-                raise AccessError("unknown signing key")
+                raise AuthError("unknown signing key")
             return self._keys[kid]
 
     def verify(self, token: str, now: float | None = None) -> Identity:
         parts = token.split(".")
         if len(parts) != 3:
-            raise AccessError("malformed token")
+            raise AuthError("malformed token")
         try:
             header = json.loads(b64url_decode(parts[0]))
             claims = json.loads(b64url_decode(parts[1]))
             signature = b64url_decode(parts[2])
         except ValueError as exc:
-            raise AccessError("malformed token") from exc
+            raise AuthError("malformed token") from exc
         if header.get("alg") != "RS256":
-            raise AccessError("unexpected algorithm")
+            raise AuthError("unexpected algorithm")
         n, e = self._key(header.get("kid", ""))
         if not rsa_verify_sha256(f"{parts[0]}.{parts[1]}".encode(), signature, n, e):
-            raise AccessError("bad signature")
+            raise AuthError("bad signature")
         audiences = claims.get("aud")
         audiences = audiences if isinstance(audiences, list) else [audiences]
         if self.audience not in audiences:
-            raise AccessError("token is for another application")
+            raise AuthError("token is for another application")
         if claims.get("iss") != self.issuer:
-            raise AccessError("token from another issuer")
+            raise AuthError("token from another issuer")
+        if self.token_use and claims.get("token_use") != self.token_use:
+            raise AuthError("wrong token type")
         now = time.time() if now is None else now
         if float(claims.get("exp", 0)) <= now - self.leeway:
-            raise AccessError("session expired")
+            raise AuthError("session expired")
         if float(claims.get("nbf", 0)) > now + self.leeway:
-            raise AccessError("token not yet valid")
-        email = claims.get("email") or claims.get("common_name") or claims.get("sub", "")
+            raise AuthError("token not yet valid")
+        email = claims.get("email") or claims.get("cognito:username") or claims.get("sub", "")
         return Identity(email, float(claims["exp"]), claims.get("sub", ""))

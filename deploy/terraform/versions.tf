@@ -6,10 +6,6 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.80"
     }
-    cloudflare = {
-      source  = "cloudflare/cloudflare"
-      version = "~> 4.52"
-    }
     archive = {
       source  = "hashicorp/archive"
       version = "~> 2.7"
@@ -28,5 +24,11 @@ provider "aws" {
   }
 }
 
-# Reads CLOUDFLARE_API_TOKEN from the environment.
-provider "cloudflare" {}
+# CloudFront certificates must live in us-east-1.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+  default_tags {
+    tags = { Project = var.name }
+  }
+}

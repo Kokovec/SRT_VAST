@@ -6,9 +6,13 @@
 * Collects the JSON log events every component sends over UDP (see
   ``srtvast.UdpEventHandler``) and pushes them to the page over Server-Sent
   Events (``/events``), with a backlog for late joiners.
-* Behind Cloudflare Access (``--access-team`` + ``--access-aud``), every
-  request must carry a valid Access JWT; streams end when the user's session
-  does, and ``/api/session`` tells the page who is signed in until when.
+* With ``--auth-issuer`` + ``--auth-audience`` (Cognito user pool + app
+  client), every request must carry a valid session token in the
+  ``srtvast_session`` cookie (set by the starter Lambda after sign-in);
+  signed-out visitors are sent to ``/_auth/login``. Streams end when the
+  user's session does, and ``/api/session`` tells the page who is signed in
+  until when.
+* ``--tls-port`` adds an HTTPS listener: the hop from CloudFront to the host.
 * ``/api/status`` reports how many streams are open and for how long nobody
   has watched; the host's idle watchdog stops the instance on it.
 
@@ -24,6 +28,7 @@ import logging
 import math
 import os
 import queue
+import ssl
 import subprocess
 import threading
 import time
@@ -31,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import setup_logging
-from .access import AccessError, AccessVerifier, Identity, token_from_headers
+from .auth import SESSION_COOKIE, AuthError, Identity, JwtVerifier, cookie_value
 from .transport import udp_receiver
 from .ts import PacketReader
 
@@ -156,18 +161,30 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def _identity(self) -> Identity | None:
-        """The signed-in user, or None after answering 403. Open access without a verifier."""
+        """The signed-in user, or None after answering. Open access without a verifier.
+
+        Pages redirect to sign-in; API and stream requests get 401 (never a 5xx,
+        which CloudFront would treat as "origin down" and fail over).
+        """
         verifier = self.server.verifier
         if verifier is None:
             return Identity("", math.inf)
-        token = token_from_headers(self.headers)
+        token = cookie_value(self.headers.get("Cookie"), SESSION_COOKIE)
         try:
             if not token:
-                raise AccessError("no Cloudflare Access token")
+                raise AuthError("not signed in")
             return verifier.verify(token)
-        except AccessError as exc:
-            log.warning("rejected %s %s: %s", self.address_string(), self.path, exc)
-            self._send(403, b"Forbidden: sign in through Cloudflare Access\n", "text/plain")
+        except AuthError as exc:
+            path = self.path.split("?", 1)[0]
+            log.info("unauthenticated %s %s: %s", self.address_string(), path, exc)
+            if path in ("/", "/index.html"):
+                self.send_response(302)
+                self.send_header("Location", "/_auth/login")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self._send(401, b"sign in required\n", "text/plain")
             return None
 
     def _json(self, data) -> None:
@@ -244,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, addr, video: Hub, events: Hub, verifier: AccessVerifier | None = None) -> None:
+    def __init__(self, addr, video: Hub, events: Hub, verifier: JwtVerifier | None = None) -> None:
         super().__init__(addr, Handler)
         self.video = video
         self.events = events
@@ -268,16 +285,22 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8090)
     p.add_argument("--backlog", type=int, default=500, help="events replayed to a newly opened page")
-    p.add_argument("--access-team", default=os.environ.get("CF_ACCESS_TEAM_DOMAIN"),
-                   help="Cloudflare Access team domain (myteam.cloudflareaccess.com); enables JWT checks")
-    p.add_argument("--access-aud", default=os.environ.get("CF_ACCESS_AUD"),
-                   help="Cloudflare Access application audience (AUD) tag")
+    p.add_argument("--auth-issuer", default=os.environ.get("AUTH_ISSUER"),
+                   help="token issuer, e.g. https://cognito-idp.us-west-2.amazonaws.com/<pool id>; enables sign-in")
+    p.add_argument("--auth-audience", default=os.environ.get("AUTH_AUDIENCE"),
+                   help="expected token audience (the Cognito app client ID)")
+    p.add_argument("--tls-port", type=int, default=int(os.environ.get("TLS_PORT", 0)),
+                   help="also serve HTTPS on this port (the CloudFront origin)")
+    p.add_argument("--tls-cert", default=os.environ.get("TLS_CERT"), help="certificate chain (PEM)")
+    p.add_argument("--tls-key", default=os.environ.get("TLS_KEY"), help="private key (PEM)")
     p.add_argument("--log-level", default="INFO")
     args = p.parse_args(argv)
     setup_logging(args.log_level)
-    if bool(args.access_team) != bool(args.access_aud):
-        p.error("--access-team and --access-aud go together")
-    verifier = AccessVerifier(args.access_team, args.access_aud) if args.access_team else None
+    if bool(args.auth_issuer) != bool(args.auth_audience):
+        p.error("--auth-issuer and --auth-audience go together")
+    if args.tls_port and not (args.tls_cert and args.tls_key):
+        p.error("--tls-port needs --tls-cert and --tls-key")
+    verifier = JwtVerifier(args.auth_issuer, args.auth_audience) if args.auth_issuer else None
 
     video = Hub(maxsize=2000)            # ~20 s of 2.6 Mb/s in 1316-byte chunks
     events = Hub(maxsize=1000, backlog=args.backlog)
@@ -285,9 +308,28 @@ def main(argv: list[str] | None = None) -> None:
     threading.Thread(target=pull_srt, args=(args.srt, video), daemon=True, name="srt").start()
     threading.Thread(target=receive_events, args=(args.events_udp, events), daemon=True, name="events").start()
     server = ViewerServer((args.host, args.port), video, events, verifier)
+    if args.tls_port:
+        context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        tls = ViewerServer((args.host, args.tls_port), video, events, verifier)
+        tls.socket = context.wrap_socket(tls.socket, server_side=True)
+        tls.last_active = server.last_active
+        server.touch = tls.touch = _shared_touch(server, tls)
+        threading.Thread(target=tls.serve_forever, daemon=True, name="https").start()
+        log.info("viewer https on %s:%d (%s)", args.host, args.tls_port, args.tls_cert)
     log.info("viewer on http://%s:%d (feed %s, events udp %s, %s)", args.host, args.port, args.srt, args.events_udp,
-             f"Cloudflare Access {verifier.issuer}" if verifier else "no authentication")
+             f"sign-in via {verifier.issuer}" if verifier else "no authentication")
     server.serve_forever()
+
+
+def _shared_touch(*servers: ViewerServer):
+    """Both listeners share the hubs; keep their idle clocks in step too."""
+    def touch() -> None:
+        now = time.time()
+        for s in servers:
+            s.last_active = now
+    return touch
 
 
 if __name__ == "__main__":

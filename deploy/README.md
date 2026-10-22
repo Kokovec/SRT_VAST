@@ -1,83 +1,106 @@
-# Deploying to AWS behind Cloudflare Access
+# Deploying to AWS (CloudFront + Cognito, start on sign-in)
 
 One small Graviton EC2 instance runs the whole stack. It is **stopped whenever
-nobody is watching** and **started when someone signs in**. Access is per-person
-(email allow-list) with a **30-minute session**.
+nobody is watching** and **started when someone signs in**. Each person has
+their own login, and a session lasts **30 minutes**. Everything is in AWS, on an
+existing Route 53 domain; only records under the viewer hostname are created.
 
 ```
-browser ──▶ Cloudflare Access ──▶ Worker "waker" ──▶ Tunnel ──▶ EC2 (no inbound ports)
-            email code login      origin down?        cloudflared ──▶ viewer :8090
-            30-min session          └─▶ EC2 StartInstances, "Starting…" page
+                 ┌────────────── CloudFront (srt.<domain>, ACM certificate) ──────────────┐
+browser ───────▶ │ /_auth/*  ─────────────────────────────▶ starter Lambda (sign-in flow) │
+                 │ everything else ─▶ origin group:                                        │
+                 │     1. the instance  https://origin.srt.<domain>  (Let's Encrypt cert)  │
+                 │     2. on 5xx / no answer ─▶ starter Lambda: signed in? start EC2,      │
+                 │                                 show "Starting…" page                   │
+                 └─────────────────────────────────────────────────────────────────────────┘
+                      Cognito hosted login (user pool: only the people you add)
 ```
 
 | What | How |
 |---|---|
-| Who gets in | Cloudflare Access app on the hostname, policy = `allowed_emails`. Login with a one-time code sent by email. |
-| Start on sign-in | Every request passes through the Worker (after Access). If the tunnel has no connector (instance stopped or booting) it calls `ec2:StartInstances` with an IAM user that may only start **this** instance, and shows a page that reloads until the viewer is up (≈1–2 min cold, longer on the very first boot while the image builds). |
-| Stop on sign-out / idle | `srt-vast-idle.timer` (every 30 s) asks the viewer's `/api/status`; after `idle_minutes` (5) with no page open it powers the OS off, and `instance_initiated_shutdown_behavior = stop` turns that into an instance stop. The page's **Log out** button ends the Access session, so its streams close and the idle clock starts. |
-| 30-minute session | Access `session_duration = 30m`. The viewer verifies the Access JWT on every request and closes the video and event streams at the token's expiry; the page then returns to sign-in. Streams that were already open do not outlive the session. |
+| Who gets in | A Cognito user pool where only admins create users (`allowed_emails`). Each person gets an email with a temporary password and chooses their own on first sign-in. |
+| Start on sign-in | CloudFront tries the instance first (2 s connect timeout). If it is stopped or still booting, CloudFront fails over to the starter Lambda. The Lambda checks the session cookie (signed-out visitors are sent to sign in first, so only allowed people can wake the instance), starts the instance, and returns a page that reloads until the viewer answers (≈1–2 min cold; longer on the very first boot while the image builds). |
+| Stop on sign-out / idle | `srt-vast-idle.timer` (every 30 s) asks the viewer's `/api/status`; after `idle_minutes` (5) with no page open it powers the OS off, and `instance_initiated_shutdown_behavior = stop` makes that an instance stop. **Log out** ends both the app session and the Cognito login. |
+| 30-minute session | The Cognito ID token lives `session_minutes` (30) and is never silently renewed. The viewer verifies it on every request and closes the video and event streams at its expiry; the page then signs the user out, so the next visit asks for the password again. |
+| What can reach the instance | Inbound 443 only, and only from CloudFront's origin-facing IP ranges (AWS-managed prefix list). The CloudFront-to-instance hop is HTTPS with a Let's Encrypt certificate for `origin.<hostname>`, obtained and renewed at boot through a Route 53 DNS challenge. Admin shell: SSM Session Manager. |
+| Changing IP | The instance gets a new public IP at each start; the boot script updates `origin.<hostname>` (TTL 30 s) before anything else. No Elastic IP to pay for while stopped. |
+| Code updates | Terraform zips the repo to a private S3 bucket. At every boot the host re-reads config from SSM Parameter Store and rebuilds only if the bundle changed. So: `terraform apply`, then the next start picks it up. |
 | Backstops | The instance also stops if the viewer is not up 15 min after boot (broken stack) or after `max_uptime_hours` (12). |
-| No open ports | Security group has no inbound rules. The viewer listens on the host's loopback only (for the watchdog); everything else stays on the Docker network. Admin shell: SSM Session Manager. |
-| Code updates | Terraform zips the repo to a private S3 bucket. At every boot the host re-reads config/secrets from SSM Parameter Store, and rebuilds only if the bundle changed. So: `terraform apply`, then the next start picks it up. |
 
 ## Cost
 
-On-demand us-east-1, approximate. Verify with the AWS pricing calculator.
+On-demand us-west-2, approximate. Verify with the AWS pricing calculator.
 
 | | Monthly |
 |---|---|
-| `c7g.large` while running (≈ $0.073/h) | ≈ $0.07 × hours used, e.g. 40 h ≈ $3 |
+| `c7g.large` while running (≈ $0.073/h) | e.g. 40 h ≈ $3 |
 | Public IPv4 while running (≈ $0.005/h) | ≈ $0.20 for 40 h |
 | 20 GB gp3 root volume (always) | ≈ $1.60 |
-| S3 bundle, SSM parameters | ≈ $0 |
-| Cloudflare Tunnel, Access (≤ 50 users), Worker (≤ 100k req/day) | $0 |
-| Data out: ≈ 1.2 GB per viewer-hour, first 100 GB/month free | $0.09/GB beyond that |
+| CloudFront (always-free tier: 1 TB out, 10 M requests / month) | $0 at this scale |
+| Cognito Lite (free up to 10,000 monthly active users), Lambda, S3 bundle, SSM | ≈ $0 |
+| Route 53 records in your existing zone | $0 extra |
 
-## Prerequisites
+Video leaves through CloudFront, so viewing costs nothing until 1 TB/month
+(≈ 850 viewer-hours at 2.6 Mb/s).
 
-- An AWS account and credentials for Terraform (`aws configure` / env vars).
-- A Cloudflare account with a domain (zone) on it, and a Zero Trust team
-  (free plan; the team domain looks like `myteam.cloudflareaccess.com`).
-- A Cloudflare API token (`CLOUDFLARE_API_TOKEN`) with:
-  Account › Cloudflare Tunnel: Edit, Account › Access: Apps and Policies: Edit,
-  Account › Access: Organizations, Identity Providers, and Groups: Edit,
-  Account › Workers Scripts: Edit, Zone › Workers Routes: Edit, Zone › DNS: Edit.
-- Terraform ≥ 1.6, or Docker: `docker run --rm -it -v "$PWD:/repo" -w /repo/deploy/terraform -e CLOUDFLARE_API_TOKEN -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY hashicorp/terraform:1.9.8 <command>`.
+## How it is deployed
 
-## Deploy
+Two Terraform configurations:
+
+1. **[bootstrap/](bootstrap/)**, applied once with an admin identity, creates:
+   - the scoped **`srt-vast-deploy`** role the main config runs as. It can only
+     create/modify `srt-vast` resources, change DNS records at or under the
+     viewer hostname (never the rest of the zone), and launch small Graviton
+     instances in one region;
+   - the **`srt-vast-boundary`** permissions boundary, which every role the
+     deploy role creates must carry (no privilege escalation);
+   - the **Cognito user pool**: Cognito has no tag-based access control, so the
+     pool is created here and the deploy role is confined to this one pool's ARN.
+2. **[terraform/](terraform/)**, run as the deploy role, creates everything else.
 
 ```bash
-cd deploy/terraform
-cp terraform.tfvars.example terraform.tfvars   # fill in account/zone IDs, hostname, team domain, emails
-terraform init
-terraform apply
+# once, as an admin
+cd deploy/bootstrap
+cat > terraform.tfvars <<EOF
+deployer_arns = ["arn:aws:iam::<account>:user/<you>"]
+domain        = "example.com"
+hostname      = "srt.example.com"
+EOF
+AWS_PROFILE=<admin profile> terraform init && AWS_PROFILE=<admin profile> terraform apply
+
+# the stack, as the deploy role (profile with role_arn = the deploy role)
+cd ../terraform
+cp terraform.tfvars.example terraform.tfvars   # emails + the bootstrap outputs
+AWS_PROFILE=srt-vast terraform init && AWS_PROFILE=srt-vast terraform apply
 ```
 
-The first boot installs Docker, builds the image and renders the ad creatives
-(≈ 5–10 min); the instance then stops itself after the idle period. Open the
-`url` output, sign in with an allowed email, and the instance starts.
+No Terraform installed? Run it from Docker, e.g.
+`docker run --rm -it -v "$PWD/../..:/repo" -v ~/.aws:/root/.aws:ro -e AWS_PROFILE=srt-vast -w /repo/deploy/terraform hashicorp/terraform:1.9.8 apply`.
 
-- **Add or remove people:** edit `allowed_emails`, `terraform apply`. Removal is
-  effective at the person's next request; to cut a live session immediately,
-  revoke it in Zero Trust › Access › Applications.
-- **Ship code changes:** `terraform apply` (uploads a new bundle); the next start
-  rebuilds. To apply right away: `aws ssm start-session --target <instance>` then
-  `sudo systemctl restart srt-vast`.
-- **Logs on the host:** `journalctl -u srt-vast -u srt-vast-idle`,
-  `sudo docker compose -p srt-vast logs -f stitcher`.
-- **Tear down:** `terraform destroy`.
+The first boot installs Docker, builds the image and renders the ad creatives
+(≈ 5–10 min), then the instance stops itself after the idle period. Open the
+`url` output, sign in, and the instance starts.
+
+- **Add or remove people:** edit `allowed_emails`, `terraform apply`. New people
+  get an invitation email (Cognito's built-in sender: ≈ 50 emails/day). A removed
+  person's current session still runs to its 30-minute end.
+- **Ship code changes:** `terraform apply` uploads a new bundle; the next start
+  rebuilds. To apply now: `sudo systemctl restart srt-vast` in an SSM session.
+- **Logs:** on the host `journalctl -u srt-vast -u srt-vast-idle` and
+  `sudo docker compose -p srt-vast logs -f stitcher`; the starter Lambda logs to
+  CloudWatch `/aws/lambda/srt-vast-starter`.
+- **Tear down:** `terraform destroy` in `terraform/`, then in `bootstrap/` (the
+  user pool has deletion protection on; turn it off first).
 
 ## Security notes
 
-- Terraform state contains the tunnel token and the Worker's AWS key. Keep it
-  local or in an encrypted, access-controlled backend (S3 + DynamoDB lock, or
-  Terraform Cloud), never in git (`.gitignore` covers the local files).
-- The Worker's IAM user can describe instances (EC2 has no resource scoping for
-  that) and start this one instance; it cannot stop, modify or create anything.
-- The instance role can read only its own bundle object and parameter path.
-- The viewer trusts nothing but a valid Access JWT for this application's AUD,
-  checked against the team's published signing keys, so a request that somehow
-  bypassed Cloudflare would still be refused.
-- The raw SRT outputs are not exposed. If outside players need SRT, publish it
-  separately with an SRT passphrase plus a security-group IP allow-list
-  (SRT has no per-user credentials).
+- Terraform state holds the Cognito app client secret. Keep it local or in an
+  encrypted, access-controlled backend, never in git (`.gitignore` covers it).
+- The viewer and the starter Lambda accept only RS256 ID tokens from this user
+  pool for this app client, checked against the pool's published keys.
+- The starter Lambda is a function URL with IAM auth; only this CloudFront
+  distribution may invoke it (origin access control + resource policy). Its role
+  can describe instances and start this one.
+- The host role can read its own bundle object and parameters, and change only
+  its `origin.` A record and the Let's Encrypt `_acme-challenge` TXT record.
+- The raw SRT outputs are not exposed.

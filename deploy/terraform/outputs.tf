@@ -1,5 +1,5 @@
 output "url" {
-  description = "Share this with the allowed people."
+  description = "Share this with the allowed people (they also get an email with a temporary password)."
   value       = "https://${var.hostname}"
 }
 
@@ -8,10 +8,10 @@ output "instance_id" {
 }
 
 output "ssm_shell" {
-  description = "Admin shell on the host (no SSH, no open ports)."
+  description = "Admin shell on the host (needs the Session Manager plugin)."
   value       = "aws ssm start-session --region ${var.aws_region} --target ${aws_instance.host.id}"
 }
 
-output "access_aud" {
-  value = cloudflare_zero_trust_access_application.viewer.aud
+output "cloudfront_domain" {
+  value = aws_cloudfront_distribution.viewer.domain_name
 }

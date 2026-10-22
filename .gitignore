@@ -10,3 +10,4 @@ deploy/terraform/terraform.tfvars
 deploy/bootstrap/.terraform/
 deploy/bootstrap/*.tfstate*
 deploy/bootstrap/terraform.tfvars
+deploy/*/tfplan
