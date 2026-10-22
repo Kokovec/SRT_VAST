@@ -71,12 +71,13 @@ resource "aws_lambda_function" "starter" {
 
   environment {
     variables = {
-      PUBLIC_HOST    = var.hostname
-      COGNITO_DOMAIN = "${aws_cognito_user_pool_domain.login.domain}.auth.${var.aws_region}.amazoncognito.com"
-      CLIENT_ID      = aws_cognito_user_pool_client.viewer.id
-      CLIENT_SECRET  = aws_cognito_user_pool_client.viewer.client_secret
-      ISSUER         = local.issuer
-      INSTANCE_ID    = aws_instance.host.id
+      PUBLIC_HOST     = var.hostname
+      COGNITO_DOMAIN  = "${aws_cognito_user_pool_domain.login.domain}.auth.${var.aws_region}.amazoncognito.com"
+      CLIENT_ID       = aws_cognito_user_pool_client.viewer.id
+      CLIENT_SECRET   = aws_cognito_user_pool_client.viewer.client_secret
+      ISSUER          = local.issuer
+      INSTANCE_ID     = aws_instance.host.id
+      SESSION_MINUTES = tostring(var.session_minutes)
     }
   }
 

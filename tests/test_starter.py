@@ -114,3 +114,17 @@ class StarterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PausedTests(unittest.TestCase):
+    def test_budget_block_shows_paused_page(self):
+        ec2 = FakeEc2()
+        def denied(InstanceIds):
+            raise RuntimeError("An error occurred (UnauthorizedOperation) when calling the StartInstances operation")
+        ec2.start_instances = denied
+        h = load_handler(ec2)
+        cookie = [f"srtvast_session={make_token(exp=int(time.time()) + 600)}"]
+        r = h.handler(event("/", cookies=cookie), None)
+        self.assertEqual(r["statusCode"], 200)
+        self.assertIn("Paused: budget limit reached", r["body"])
+        self.assertNotIn('http-equiv="refresh"', r["body"])

@@ -33,6 +33,7 @@ COGNITO = f"https://{os.environ['COGNITO_DOMAIN']}"
 CLIENT_ID = os.environ["CLIENT_ID"]
 CLIENT_SECRET = os.environ["CLIENT_SECRET"]
 INSTANCE_ID = os.environ["INSTANCE_ID"]
+SESSION_MINUTES = os.environ.get("SESSION_MINUTES", "30")
 CALLBACK = f"{BASE}/_auth/callback"
 SIGNED_OUT = f"{BASE}/_auth/signed-out"
 STATE_COOKIE = "srtvast_state"
@@ -53,7 +54,7 @@ def handler(event, context):
     if path == "/_auth/logout":
         return logout()
     if path == "/_auth/signed-out":
-        return page("Signed out", "You are signed out. Sessions last 30 minutes.",
+        return page("Signed out", f"You are signed out. Sessions last {SESSION_MINUTES} minutes.",
                     '<a class="btn" href="/_auth/login">Sign in</a>')
     return wake(cookies, accept)
 
@@ -124,9 +125,16 @@ def wake(cookies, accept):
             log("started", email=who.email, instance=INSTANCE_ID)
             state = "starting"
     except Exception as exc:  # noqa: BLE001
-        log("wake_failed", error=str(exc))
-        state = "unavailable"
+        # The budget action attaches a deny on ec2:StartInstances when the monthly limit is hit.
+        state = "paused" if "UnauthorizedOperation" in str(exc) or "AccessDenied" in str(exc) else "unavailable"
+        log("wake_failed", error=str(exc), state=state)
 
+    if state == "paused":
+        return page("Paused: budget limit reached",
+                    "This month's cost limit for the stream server has been reached, so it won't start "
+                    "until the owner authorizes it again.",
+                    f'<p class="muted">signed in as {html.escape(who.email)} · <a href="/_auth/logout">Log out</a></p>',
+                    status=200 if "text/html" in accept else 503)
     if "text/html" not in accept:  # streams / API: the page retries on its own
         return {"statusCode": 503, "headers": {"Cache-Control": "no-store", "Retry-After": "10"},
                 "body": f"stream server {state}\n"}

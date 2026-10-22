@@ -2,7 +2,7 @@
 
 One small Graviton EC2 instance runs the whole stack. It is **stopped whenever
 nobody is watching** and **started when someone signs in**. Each person has
-their own login, and a session lasts **30 minutes**. Everything is in AWS, on an
+their own login, and a session lasts **`session_minutes`** (30 by default). Everything is in AWS, on an
 existing Route 53 domain; only records under the viewer hostname are created.
 
 ```
@@ -21,7 +21,7 @@ browser ───────▶ │ /_auth/*  ───────────
 | Who gets in | A Cognito user pool where only admins create users (`allowed_emails`). Each person gets an invitation email with the sign-in link, their username and a temporary password (alone on its own line, in bold), and chooses their own password on first sign-in. |
 | Start on sign-in | CloudFront tries the instance first (2 s connect timeout). If it is stopped or still booting, CloudFront fails over to the starter Lambda. The Lambda checks the session cookie (signed-out visitors are sent to sign in first, so only allowed people can wake the instance), starts the instance, and returns a page that reloads until the viewer answers. That takes ≈ 1–2 min, or ≈ 3–5 min on the first start after a code change, because the image rebuilds. |
 | Stop on sign-out / idle | `srt-vast-idle.timer` (every 30 s) asks the viewer's `/api/status`; after `idle_minutes` (5) with no page open it powers the OS off, and `instance_initiated_shutdown_behavior = stop` makes that an instance stop. **Log out** ends both the app session and the Cognito login. |
-| 30-minute session | The Cognito ID token lives `session_minutes` (30) and is never silently renewed. The viewer verifies it on every request and closes the video and event streams at its expiry; the page then signs the user out, so the next visit asks for the password again. |
+| Session length | The Cognito ID token lives `session_minutes` (30 by default; long enough for a dozen ad breaks even at 15) and is never silently renewed. The viewer verifies it on every request and closes the video and event streams at its expiry; the page then signs the user out, so the next visit asks for the password again. |
 | What can reach the instance | Inbound 443 only, and only from CloudFront's origin-facing IP ranges (AWS-managed prefix list). The CloudFront-to-instance hop is HTTPS with a Let's Encrypt certificate for `origin.<hostname>`, obtained and renewed at boot through a Route 53 DNS challenge. Admin shell: SSM Session Manager. |
 | Changing IP | The instance gets a new public IP at each start; the boot script updates `origin.<hostname>` (TTL 30 s) before anything else. No Elastic IP to pay for while stopped. |
 | Code updates | Terraform zips the repo to a private S3 bucket. At every boot the host re-reads config from SSM Parameter Store and rebuilds only if the bundle changed. So: `terraform apply`, then the next start picks it up. |
@@ -45,6 +45,29 @@ viewer pulls the program (up to ≈ 2.6 Mb/s; the test pattern runs nearer 1.1 M
 plus the incoming preview (≈ 0.24 Mb/s), so the free tier covers roughly 780–1,700
 viewer-hours a month. Beyond it, about $0.085/GB (≈ $0.11 per viewer-hour at
 the bitrate cap). Data from the instance into CloudFront is free.
+
+## Cost cap ($50/month by default)
+
+[bootstrap/budget.tf](bootstrap/budget.tf) creates an AWS Budget, `<name>-monthly`, that
+counts only resources tagged `Project=<name>`, and emails `budget_email` at 80 % of actual
+and 100 % of forecast spend. When **actual** spend passes `budget_limit_usd`, two budget
+actions run automatically:
+
+- **stop the instance**, and
+- **attach a deny on `ec2:StartInstances` to the starter Lambda's role**, so a sign-in
+  can't wake it. Signed-in users see "Paused: budget limit reached" instead.
+
+Nothing restarts until you authorize it:
+
+```bash
+AWS_PROFILE=<admin profile> deploy/budget-resume.sh   # reverses the actions; next sign-in starts it
+```
+
+If the month's spend is still above the limit, raise `budget_limit_usd` (bootstrap) to keep
+running. AWS updates budget spend a few times a day, with up to ≈ 24 h of billing lag, so the
+stop can come shortly after the limit is passed. Only costs incurred after the `Project` tag
+was activated for cost allocation are counted. The budget needs the main stack's
+`starter_role_name` and `instance_id` outputs in the bootstrap's tfvars.
 
 ## How it is deployed
 
@@ -90,7 +113,7 @@ The first boot installs Docker, builds the image and renders the ad creatives
 
 - **Add or remove people:** edit `allowed_emails`, `terraform apply`. New people
   get an invitation email (Cognito's built-in sender: ≈ 50 emails/day). A removed
-  person's current session still runs to its 30-minute end.
+  person's current session still runs to its end (at most `session_minutes`).
 - **Ship code changes:** `terraform apply` uploads a new bundle (the plan should
   show only `aws_s3_object.bundle`). The next start rebuilds, adding a few minutes.
   To apply to a running instance now, restart the stack over SSM (this interrupts

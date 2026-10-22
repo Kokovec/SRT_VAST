@@ -15,3 +15,8 @@ output "ssm_shell" {
 output "cloudfront_domain" {
   value = aws_cloudfront_distribution.viewer.domain_name
 }
+
+output "starter_role_name" {
+  description = "For deploy/bootstrap's budget action (blocks restarts when the budget is hit)."
+  value       = aws_iam_role.starter.name
+}

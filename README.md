@@ -92,7 +92,7 @@ http://localhost:8090 (locally; on AWS, behind sign-in at the deployment's URL):
 
 [deploy/README.md](deploy/README.md) runs the stack on one EC2 instance behind
 CloudFront, all in AWS on your existing Route 53 domain. Each person signs in
-with their own Cognito login, sessions last 30 minutes, the instance starts when
+with their own Cognito login, sessions are time-limited (`session_minutes`, 30 by default), the instance starts when
 someone signs in and stops after 5 minutes with nobody watching, and only
 CloudFront can reach the instance. Terraform in [deploy/](deploy/) provisions all of it.
 

@@ -503,7 +503,7 @@
     if (player) { try { player.destroy(); } catch { /* gone */ } player = null; }
     if (typeof stopPip === "function") stopPip();
     $("overlay").hidden = false;
-    $("overlay").textContent = "Your 30-minute session has ended. Signing you out…";
+    $("overlay").textContent = "Your session has ended. Signing you out…";
     setTimeout(() => { location.href = "/_auth/logout?reason=expired"; }, 2500);
   }
 
