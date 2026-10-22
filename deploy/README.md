@@ -18,7 +18,7 @@ browser ───────▶ │ /_auth/*  ───────────
 
 | What | How |
 |---|---|
-| Who gets in | A Cognito user pool where only admins create users (`allowed_emails`). Each person gets an email with a temporary password and chooses their own on first sign-in. |
+| Who gets in | A Cognito user pool where only admins create users (`allowed_emails`). Each person gets an invitation email with the sign-in link, their username and a temporary password (alone on its own line, in bold), and chooses their own password on first sign-in. |
 | Start on sign-in | CloudFront tries the instance first (2 s connect timeout). If it is stopped or still booting, CloudFront fails over to the starter Lambda. The Lambda checks the session cookie (signed-out visitors are sent to sign in first, so only allowed people can wake the instance), starts the instance, and returns a page that reloads until the viewer answers. That takes ≈ 1–2 min, or ≈ 3–5 min on the first start after a code change, because the image rebuilds. |
 | Stop on sign-out / idle | `srt-vast-idle.timer` (every 30 s) asks the viewer's `/api/status`; after `idle_minutes` (5) with no page open it powers the OS off, and `instance_initiated_shutdown_behavior = stop` makes that an instance stop. **Log out** ends both the app session and the Cognito login. |
 | 30-minute session | The Cognito ID token lives `session_minutes` (30) and is never silently renewed. The viewer verifies it on every request and closes the video and event streams at its expiry; the page then signs the user out, so the next visit asks for the password again. |
@@ -106,10 +106,11 @@ The first boot installs Docker, builds the image and renders the ad creatives
 
 ## Troubleshooting
 
-- **The invitation's password doesn't work.** Gmail's "Code requested" card
-  can pick up the wrong characters. Use the password from the email body.
-  An admin can also set a fresh temporary one, which the user must replace
-  on first sign-in:
+- **The invitation's password doesn't work.** Copy it from the email body.
+  It sits alone on its own line. The original invitation wording put a
+  parenthesis right after it, which Gmail's "Code requested" card picked up
+  instead; the current template avoids that. An admin can also set a fresh
+  temporary password, which the user must replace on first sign-in:
   `aws cognito-idp admin-set-user-password --user-pool-id <pool> --username <email> --password <temp> --no-permanent`.
   To send a new invitation instead: `aws cognito-idp admin-create-user --user-pool-id <pool> --username <email> --message-action RESEND`.
 - **"Forgot password" never sends an email.** Cognito sends reset codes only
