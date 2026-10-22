@@ -49,3 +49,32 @@ resource "aws_cognito_user" "allowed" {
     email_verified = true
   }
 }
+
+# People whose sign-in details are handed over by hand (no Cognito email).
+# Usernames are lower case and the pool is case-sensitive, so they must sign
+# in with the lower-case address.
+resource "random_password" "manual_invite" {
+  for_each    = toset([for e in var.manual_invite_emails : lower(e)])
+  length      = 14
+  special     = false
+  min_upper   = 2
+  min_lower   = 2
+  min_numeric = 2
+}
+
+resource "aws_cognito_user" "manual" {
+  for_each           = random_password.manual_invite
+  user_pool_id       = var.user_pool_id
+  username           = each.key
+  message_action     = "SUPPRESS"
+  temporary_password = each.value.result
+  attributes = {
+    email          = each.key
+    email_verified = true
+  }
+
+  lifecycle {
+    # After first sign-in the user sets their own password; never reset it.
+    ignore_changes = [temporary_password]
+  }
+}

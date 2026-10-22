@@ -3,8 +3,11 @@
 domain   = "example.com"     # existing Route 53 zone; only records under `hostname` are created
 hostname = "srt.example.com"
 
-allowed_emails = [
+allowed_emails = [          # invited by Cognito email
   "you@example.com",
+]
+
+manual_invite_emails = [    # no email; hand over `terraform output -json manual_invites`
   "colleague@example.com",
 ]
 

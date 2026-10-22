@@ -16,6 +16,18 @@ output "cloudfront_domain" {
   value = aws_cloudfront_distribution.viewer.domain_name
 }
 
+output "manual_invites" {
+  description = "Sign-in details to hand over: terraform output -json manual_invites"
+  sensitive   = true
+  value = {
+    for email, pw in random_password.manual_invite : email => {
+      url                = "https://${var.hostname}/"
+      username           = email
+      temporary_password = pw.result
+    }
+  }
+}
+
 output "starter_role_name" {
   description = "For deploy/bootstrap's budget action (blocks restarts when the budget is hit)."
   value       = aws_iam_role.starter.name

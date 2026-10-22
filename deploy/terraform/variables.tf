@@ -44,6 +44,12 @@ variable "allowed_emails" {
   type        = list(string)
 }
 
+variable "manual_invite_emails" {
+  description = "People allowed in whose credentials you hand over yourself: no Cognito email is sent; the temporary password is in `terraform output -json manual_invites`."
+  type        = list(string)
+  default     = []
+}
+
 variable "session_minutes" {
   description = "Session length: the ID token lifetime. Streams are cut and the user signed out when it ends."
   type        = number
